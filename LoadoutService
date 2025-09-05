@@ -1,0 +1,110 @@
+-- ReplicatedStorage/Modules/Game/LoadoutService.lua
+-- Tool giving/removing utility (merged from TagToolgiver.lua)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local GameConfig = require(script.Parent.GameConfig)
+
+local LoadoutService = {}
+
+-- Debug logging
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "Teams") then
+		print("[Teams] " .. message)
+	end
+end
+
+-- Find the tag tool in storage
+local function findTagTool(): Tool?
+	local toolName = GameConfig.Tagging.ToolName
+
+	-- Check ReplicatedStorage.Tools folder first
+	local toolsFolder = ReplicatedStorage:FindFirstChild("Tools")
+	if toolsFolder then
+		local tool = toolsFolder:FindFirstChild(toolName)
+		if tool then return tool end
+	end
+
+	-- Check directly in ReplicatedStorage
+	local tool = ReplicatedStorage:FindFirstChild(toolName)
+	if tool then return tool end
+
+	-- Fallback to StarterPack
+	local StarterPack = game:GetService("StarterPack")
+	tool = StarterPack:FindFirstChild(toolName)
+	if tool then return tool end
+
+	return nil
+end
+
+-- Give tag tool to a player
+function LoadoutService.GiveTagTool(player: Player)
+	if not player or not player.Parent then return end
+
+	local originalTool = findTagTool()
+	if not originalTool then
+		warn("LoadoutService: Could not find tool '" .. GameConfig.Tagging.ToolName .. "'")
+		return
+	end
+
+	-- Remove existing tool first
+	LoadoutService.RemoveTool(player, GameConfig.Tagging.ToolName)
+
+	-- Clone and give to player
+	local toolClone = originalTool:Clone()
+	if player.Character then
+		toolClone.Parent = player.Backpack
+		debugLog("Gave " .. GameConfig.Tagging.ToolName .. " to " .. player.Name)
+	end
+end
+
+-- Remove specific tool from player
+function LoadoutService.RemoveTool(player: Player, toolName: string)
+	if not player or not player.Parent then return end
+
+	-- Remove from backpack
+	if player.Backpack then
+		local tool = player.Backpack:FindFirstChild(toolName)
+		if tool then
+			tool:Destroy()
+		end
+	end
+
+	-- Remove from character (if equipped)
+	if player.Character then
+		local tool = player.Character:FindFirstChild(toolName)
+		if tool then
+			tool:Destroy()
+		end
+	end
+end
+
+-- Remove all tools from all players
+function LoadoutService.RemoveAllTools()
+	for _, player in pairs(Players:GetPlayers()) do
+		LoadoutService.RemoveTool(player, GameConfig.Tagging.ToolName)
+	end
+	debugLog("Removed all tools")
+end
+
+-- Handle respawn - re-give tools based on role
+local function onCharacterAdded(player: Player)
+	task.wait(0.1) -- Small delay for team assignment
+
+	local TeamsService = require(script.Parent.TeamsService)
+	local role = TeamsService.GetPlayerRole(player)
+
+	if role == "Tagger" then
+		LoadoutService.GiveTagTool(player)
+	end
+end
+
+-- Set up event handlers
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		onCharacterAdded(player)
+	end)
+end)
+
+return LoadoutService
