@@ -1,0 +1,381 @@
+-- ReplicatedStorage/Modules/Game/UI/HUD.lua
+-- Client-side HUD (minimal timer + mode display + mid-join prompts)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+
+local GameConfig = require(script.Parent.Parent.GameConfig)
+
+local HUD = {}
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- UI elements
+local screenGui = nil
+local timerLabel = nil
+local modeLabel = nil
+local midJoinFrame = nil
+local midJoinPromptActive = false
+
+-- Config helper
+local function Cfg(path)
+	local keys = string.split(path, ".")
+	local value = GameConfig
+	for _, key in ipairs(keys) do
+		value = value[key]
+		if not value then break end
+	end
+	return value
+end
+
+-- Debug logging
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "HUD") then
+		print("[HUD] " .. message)
+	end
+end
+
+-- Format time as MM:SS
+local function formatTime(seconds: number): string
+	local mins = math.floor(seconds / 60)
+	local secs = math.floor(seconds % 60)
+	return string.format("%02d:%02d", mins, secs)
+end
+
+-- Create mid-join prompt
+local function createMidJoinPrompt(data)
+	if midJoinFrame or midJoinPromptActive then return end
+
+	midJoinPromptActive = true
+
+	-- Main frame
+	midJoinFrame = Instance.new("Frame")
+	midJoinFrame.Name = "MidJoinPrompt"
+	midJoinFrame.Size = UDim2.new(0, 400, 0, 200)
+	midJoinFrame.Position = UDim2.new(0.5, -200, 0.5, -100)
+	midJoinFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	midJoinFrame.BackgroundTransparency = 0.2
+	midJoinFrame.BorderSizePixel = 0
+	midJoinFrame.Parent = screenGui
+
+	-- Rounded corners
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = midJoinFrame
+
+	-- Title
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 40)
+	title.Position = UDim2.new(0, 0, 0, 10)
+	title.BackgroundTransparency = 1
+	title.Text = "Join Match?"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextScaled = true
+	title.Font = Enum.Font.GothamBold
+	title.Parent = midJoinFrame
+
+	-- Message
+	local message = Instance.new("TextLabel")
+	message.Size = UDim2.new(1, -20, 0, 60)
+	message.Position = UDim2.new(0, 10, 0, 50)
+	message.BackgroundTransparency = 1
+	local promptText = Cfg("Strings.MidJoinPrompt"):gsub("{mode}", data.modeName):gsub("{map}", data.mapName)
+	message.Text = promptText
+	message.TextColor3 = Color3.fromRGB(200, 200, 200)
+	message.TextScaled = true
+	message.Font = Enum.Font.Gotham
+	message.Parent = midJoinFrame
+
+	-- Buttons container
+	local buttonContainer = Instance.new("Frame")
+	buttonContainer.Size = UDim2.new(1, -20, 0, 50)
+	buttonContainer.Position = UDim2.new(0, 10, 0, 120)
+	buttonContainer.BackgroundTransparency = 1
+	buttonContainer.Parent = midJoinFrame
+
+	local buttonLayout = Instance.new("UIListLayout")
+	buttonLayout.FillDirection = Enum.FillDirection.Horizontal
+	buttonLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	buttonLayout.Padding = UDim.new(0, 20)
+	buttonLayout.Parent = buttonContainer
+
+	-- Accept button
+	local acceptButton = Instance.new("TextButton")
+	acceptButton.Size = UDim2.new(0, 140, 1, 0)
+	acceptButton.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
+	acceptButton.BorderSizePixel = 0
+	acceptButton.Text = "Join Game"
+	acceptButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	acceptButton.TextScaled = true
+	acceptButton.Font = Enum.Font.GothamBold
+	acceptButton.Parent = buttonContainer
+
+	local acceptCorner = Instance.new("UICorner")
+	acceptCorner.CornerRadius = UDim.new(0, 8)
+	acceptCorner.Parent = acceptButton
+
+	-- Decline button
+	local declineButton = Instance.new("TextButton")
+	declineButton.Size = UDim2.new(0, 140, 1, 0)
+	declineButton.BackgroundColor3 = Color3.fromRGB(150, 0, 0)
+	declineButton.BorderSizePixel = 0
+	declineButton.Text = "Stay Spectator"
+	declineButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	declineButton.TextScaled = true
+	declineButton.Font = Enum.Font.GothamBold
+	declineButton.Parent = buttonContainer
+
+	local declineCorner = Instance.new("UICorner")
+	declineCorner.CornerRadius = UDim.new(0, 8)
+	declineCorner.Parent = declineButton
+
+	-- Timeout countdown
+	local timeoutLabel = Instance.new("TextLabel")
+	timeoutLabel.Size = UDim2.new(1, 0, 0, 25)
+	timeoutLabel.Position = UDim2.new(0, 0, 1, -35)
+	timeoutLabel.BackgroundTransparency = 1
+	timeoutLabel.Text = "Timeout in " .. Cfg("MidJoin.PromptTimeout") .. "s"
+	timeoutLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+	timeoutLabel.TextScaled = true
+	timeoutLabel.Font = Enum.Font.Gotham
+	timeoutLabel.Parent = midJoinFrame
+
+	-- Handle responses
+	local function respond(accepted: boolean)
+		if not midJoinFrame then return end
+
+		local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+		if remotes then
+			local responseRemote = remotes:FindFirstChild(Cfg("RemoteNames.MidJoinResponse"))
+			if responseRemote then
+				responseRemote:FireServer(accepted)
+			end
+		end
+
+		HUD.HideMidJoinPrompt()
+	end
+
+	acceptButton.Activated:Connect(function()
+		respond(true)
+	end)
+
+	declineButton.Activated:Connect(function()
+		respond(false)
+	end)
+
+	-- Timeout countdown
+	local timeLeft = Cfg("MidJoin.PromptTimeout")
+	local timeoutConnection = nil
+	timeoutConnection = game:GetService("RunService").Heartbeat:Connect(function()
+		timeLeft = timeLeft - game:GetService("RunService").Heartbeat:Wait()
+
+		if timeLeft <= 0 then
+			timeoutConnection:Disconnect()
+			respond(false) -- Auto-decline on timeout
+		else
+			timeoutLabel.Text = "Timeout in " .. math.ceil(timeLeft) .. "s"
+		end
+	end)
+
+	debugLog("Mid-join prompt created")
+end
+
+-- Hide mid-join prompt
+function HUD.HideMidJoinPrompt()
+	if midJoinFrame then
+		midJoinFrame:Destroy()
+		midJoinFrame = nil
+		midJoinPromptActive = false
+		debugLog("Mid-join prompt hidden")
+	end
+end
+
+-- Create HUD UI
+local function createHUD()
+	if screenGui then return end
+
+	screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "GameHUD"
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = playerGui
+
+	-- Timer display
+	if Cfg("HUD.ShowTopTimer") then
+		timerLabel = Instance.new("TextLabel")
+		timerLabel.Name = "Timer"
+		timerLabel.Size = UDim2.new(0, 200, 0, 60)
+		timerLabel.Position = UDim2.new(0.5, -100, 0, 20)
+		timerLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		timerLabel.BackgroundTransparency = 0.3
+		timerLabel.BorderSizePixel = 0
+		timerLabel.Text = "00:00"
+		timerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		timerLabel.TextScaled = true
+		timerLabel.Font = Enum.Font.GothamBold
+		timerLabel.Parent = screenGui
+
+		-- Rounded corners
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 8)
+		corner.Parent = timerLabel
+	end
+
+	-- Mode and map display  
+	if Cfg("HUD.ShowModeAndMap") then
+		modeLabel = Instance.new("TextLabel")
+		modeLabel.Name = "Mode"
+		modeLabel.Size = UDim2.new(0, 300, 0, 40)
+		modeLabel.Position = UDim2.new(0.5, -150, 0, 90)
+		modeLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		modeLabel.BackgroundTransparency = 0.5
+		modeLabel.BorderSizePixel = 0
+		modeLabel.Text = "Waiting..."
+		modeLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		modeLabel.TextScaled = true
+		modeLabel.Font = Enum.Font.Gotham
+		modeLabel.Parent = screenGui
+
+		-- Rounded corners
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 6)
+		corner.Parent = modeLabel
+	end
+
+	debugLog("HUD created")
+end
+
+-- Update timer display
+local function updateTimer(timeLeft: number)
+	if not timerLabel then return end
+
+	if timeLeft > 0 then
+		timerLabel.Text = formatTime(timeLeft)
+		-- Color coding: red when < 30s, yellow when < 60s
+		if timeLeft < 30 then
+			timerLabel.BackgroundColor3 = Color3.fromRGB(150, 0, 0)
+		elseif timeLeft < 60 then
+			timerLabel.BackgroundColor3 = Color3.fromRGB(150, 150, 0)
+		else
+			timerLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		end
+	else
+		timerLabel.Text = "00:00"
+		timerLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	end
+end
+
+-- Update lobby timer display
+local function updateLobbyTimer(data)
+	if not timerLabel then return end
+
+	local timeLeft = data.timeLeft or 0
+	local current = data.current or 0
+	local minPlayers = data.minPlayers or 1
+
+	-- Update timer
+	if timeLeft > 0 then
+		timerLabel.Text = formatTime(timeLeft)
+		if data.playersReady then
+			timerLabel.BackgroundColor3 = Color3.fromRGB(0, 150, 0) -- Green when ready
+		else
+			timerLabel.BackgroundColor3 = Color3.fromRGB(150, 150, 0) -- Yellow when waiting
+		end
+	end
+
+	-- Update mode label with waiting message
+	if modeLabel then
+		local waitingText = Cfg("Strings.LobbyWaiting"):gsub("{current}", tostring(current)):gsub("{minPlayers}", tostring(minPlayers))
+		modeLabel.Text = waitingText
+	end
+end
+
+-- Update mode display
+function HUD.SetModeDisplay(text: string)
+	if modeLabel then
+		modeLabel.Text = text
+		debugLog("Mode display: " .. text)
+	end
+end
+
+-- Update display based on game state and player role
+function HUD.UpdateDisplay(gameState: string, playerRole: string?, mode: string?, map: string?)
+	if not modeLabel then return end
+
+	local message = "Waiting..."
+	local messages = Cfg("HUD.Messages")
+
+	if gameState == "Lobby" then
+		if playerRole == "Spectator" then
+			message = messages.LobbySpectator or "You are spectating"
+		else
+			message = messages.Lobby or "Waiting for match to start..."
+		end
+	elseif gameState == "Match" then
+		-- Check for role-specific messages first
+		if playerRole == "Tagger" and messages.MatchTagger then
+			message = messages.MatchTagger
+		elseif playerRole == "Player" and messages.MatchPlayer then
+			message = messages.MatchPlayer
+		elseif playerRole == "Spectator" then
+			message = messages.MatchSpectator or "Spectating {mode} on {map}"
+		else
+			message = messages.Match or "Playing {mode} on {map}"
+		end
+
+		-- Replace placeholders
+		if mode then
+			message = message:gsub("{mode}", mode)
+		end
+		if map then
+			message = message:gsub("{map}", map)
+		end
+	elseif gameState == "PostGame" then
+		message = messages.PostGame or "Match finished!"
+	end
+
+	HUD.SetModeDisplay(message)
+end
+
+-- Initialize HUD
+function HUD.Initialize()
+	createHUD()
+
+	-- Connect to timer remote
+	local remotes = ReplicatedStorage:WaitForChild("Remotes")
+
+	-- Regular round timer
+	local timerRemote = remotes:WaitForChild(Cfg("RemoteNames.RoundTime"))
+	timerRemote.OnClientEvent:Connect(updateTimer)
+
+	-- Lobby timer
+	local lobbyTimerRemote = remotes:WaitForChild(Cfg("RemoteNames.LobbyTimerUpdate"))
+	lobbyTimerRemote.OnClientEvent:Connect(updateLobbyTimer)
+
+	-- Mid-join prompts
+	if Cfg("FeatureToggles.MidJoin") then
+		local midJoinOfferRemote = remotes:WaitForChild(Cfg("RemoteNames.MidJoinOffer"))
+		midJoinOfferRemote.OnClientEvent:Connect(createMidJoinPrompt)
+
+		local midJoinClosedRemote = remotes:WaitForChild(Cfg("RemoteNames.MidJoinClosed"))
+		midJoinClosedRemote.OnClientEvent:Connect(HUD.HideMidJoinPrompt)
+	end
+
+	debugLog("HUD initialized")
+end
+
+-- Cleanup
+function HUD.Cleanup()
+	if screenGui then
+		screenGui:Destroy()
+		screenGui = nil
+		timerLabel = nil
+		modeLabel = nil
+		midJoinFrame = nil
+		midJoinPromptActive = false
+		debugLog("HUD cleaned up")
+	end
+end
+
+return HUD
