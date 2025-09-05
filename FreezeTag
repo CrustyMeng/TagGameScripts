@@ -1,0 +1,432 @@
+-- ReplicatedStorage/Modules/Game/Modes/FreezeTag.lua
+-- FreezeTag game mode (merged from original FreezeTag.lua)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local GameConfig = require(script.Parent.Parent.GameConfig)
+
+local FreezeTag = {}
+
+FreezeTag.Name = "FreezeTag"
+FreezeTag.Config = GameConfig.FreezeTag -- Read from main config
+
+-- Mode state
+local roundActive = false
+local waitingForPlayers = false
+local rescueTimers: {[string]: {rescuer: Player, frozen: Player, startTime: number}} = {}
+local rescueConnection = nil
+
+-- Config helper
+local function Cfg(path)
+	local keys = string.split(path, ".")
+	local value = GameConfig
+	for _, key in ipairs(keys) do
+		value = value[key]
+		if not value then break end
+	end
+	return value
+end
+
+-- Debug logging
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "Mode:FreezeTag") then
+		print("[Mode:FreezeTag] " .. message)
+	end
+end
+
+-- Calculate number of taggers based on player count
+local function calculateTaggerCount(totalPlayers: number): number
+	if totalPlayers <= 0 then return 0 end
+
+	local ratio = FreezeTag.Config.TaggerRatioPerPlayers or 5
+	local count = math.ceil(totalPlayers / ratio)
+
+	return math.clamp(count, 
+		FreezeTag.Config.MinTaggers or 1, 
+		FreezeTag.Config.MaxTaggers or 5)
+end
+
+-- Select random taggers from player list
+local function selectRandomTaggers(players: {Player}, count: number): {Player}
+	local shuffled = {}
+	for _, player in pairs(players) do
+		table.insert(shuffled, player)
+	end
+
+	-- Fisher-Yates shuffle
+	for i = #shuffled, 2, -1 do
+		local j = math.random(i)
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	end
+
+	local result = {}
+	for i = 1, math.min(count, #shuffled) do
+		table.insert(result, shuffled[i])
+	end
+
+	return result
+end
+
+-- Get all valid players
+local function getAllPlayers(): {Player}
+	local result = {}
+	for _, player in pairs(Players:GetPlayers()) do
+		if player and player.Parent then
+			table.insert(result, player)
+		end
+	end
+	return result
+end
+
+-- Count unfrozen players
+local function getUnfrozenPlayerCount(): number
+	local count = 0
+	local TeamsService = require(script.Parent.Parent.TeamsService)
+	local TagEffects = require(script.Parent.Parent.TagEffects)
+
+	for _, player in pairs(Players:GetPlayers()) do
+		if TeamsService.GetPlayerRole(player) == "Player" and not TagEffects.IsFrozen(player) then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+-- Check win conditions
+local function checkWinConditions()
+	if not roundActive then return end
+
+	local unfrozenCount = getUnfrozenPlayerCount()
+
+	if unfrozenCount == 0 then
+		-- Taggers win - all players frozen
+		debugLog("Taggers won! All players frozen")
+
+		-- End the match through MatchLoop
+		local MatchLoop = require(game:GetService("ServerScriptService").Modules.MatchLoop)
+		MatchLoop.EndMatch("taggers_win")
+	end
+end
+
+-- Start rescue attempt
+local function startRescueAttempt(rescuer: Player, frozen: Player)
+	local TagEffects = require(script.Parent.Parent.TagEffects)
+	local TeamsService = require(script.Parent.Parent.TeamsService)
+
+	if not TagEffects.IsFrozen(frozen) then return end
+	if TeamsService.GetPlayerRole(rescuer) ~= "Player" then return end
+	if TeamsService.GetPlayerRole(frozen) ~= "Player" then return end
+
+	local key = rescuer.Name .. ":" .. frozen.Name
+	if rescueTimers[key] then return end -- Already in progress
+
+	rescueTimers[key] = {
+		rescuer = rescuer,
+		frozen = frozen,
+		startTime = os.clock()
+	}
+
+	debugLog(rescuer.Name .. " started rescuing " .. frozen.Name)
+end
+
+-- Update rescue attempts
+local function updateRescueTimers()
+	local TagEffects = require(script.Parent.Parent.TagEffects)
+	local toRemove = {}
+
+	for key, rescueData in pairs(rescueTimers) do
+		local rescuer = rescueData.rescuer
+		local frozen = rescueData.frozen
+		local startTime = rescueData.startTime
+
+		-- Validate participants
+		if not rescuer.Parent or not frozen.Parent or not TagEffects.IsFrozen(frozen) then
+			table.insert(toRemove, key)
+			continue
+		end
+
+		-- Check distance
+		local rescuerChar = rescuer.Character
+		local frozenChar = frozen.Character
+		if not rescuerChar or not frozenChar then
+			table.insert(toRemove, key)
+			continue
+		end
+
+		local rescuerRoot = rescuerChar:FindFirstChild("HumanoidRootPart")
+		local frozenRoot = frozenChar:FindFirstChild("HumanoidRootPart")
+		if not rescuerRoot or not frozenRoot then
+			table.insert(toRemove, key)
+			continue
+		end
+
+		local distance = (rescuerRoot.Position - frozenRoot.Position).Magnitude
+		if distance > (FreezeTag.Config.RescueRange or 6) then
+			table.insert(toRemove, key) -- Too far
+			continue
+		end
+
+		-- Check if rescue complete
+		local elapsed = os.clock() - startTime
+		if elapsed >= (FreezeTag.Config.RescueHoldSeconds or 2) then
+			TagEffects.Unfreeze(frozen)
+			debugLog(rescuer.Name .. " rescued " .. frozen.Name)
+			table.insert(toRemove, key)
+		end
+	end
+
+	-- Clean up completed rescues
+	for _, key in pairs(toRemove) do
+		rescueTimers[key] = nil
+	end
+end
+
+-- Check for nearby rescue opportunities
+local function checkRescueProximity()
+	local TeamsService = require(script.Parent.Parent.TeamsService)
+	local TagEffects = require(script.Parent.Parent.TagEffects)
+	local rescueRange = FreezeTag.Config.RescueRange or 6
+
+	for _, player in pairs(Players:GetPlayers()) do
+		if TeamsService.GetPlayerRole(player) ~= "Player" or TagEffects.IsFrozen(player) then
+			continue
+		end
+
+		local character = player.Character
+		if not character then continue end
+		local rootPart = character:FindFirstChild("HumanoidRootPart")
+		if not rootPart then continue end
+
+		-- Look for nearby frozen teammates
+		for _, other in pairs(Players:GetPlayers()) do
+			if other == player or TeamsService.GetPlayerRole(other) ~= "Player" or not TagEffects.IsFrozen(other) then
+				continue
+			end
+
+			local otherChar = other.Character
+			if not otherChar then continue end
+			local otherRoot = otherChar:FindFirstChild("HumanoidRootPart")
+			if not otherRoot then continue end
+
+			local distance = (rootPart.Position - otherRoot.Position).Magnitude
+			if distance <= rescueRange then
+				startRescueAttempt(player, other)
+			end
+		end
+	end
+end
+
+-- Start match with players
+local function startMatchInternal(players: {Player})
+	debugLog("Starting match with " .. #players .. " players")
+
+	roundActive = true
+	waitingForPlayers = false
+	rescueTimers = {}
+
+	if #players < (FreezeTag.Config.MinPlayersToStart or 3) then
+		debugLog("Not enough players (" .. #players .. "/" .. (FreezeTag.Config.MinPlayersToStart or 3) .. ")")
+		return
+	end
+
+	-- Calculate and assign teams
+	local taggerCount = calculateTaggerCount(#players)
+	local taggers = selectRandomTaggers(players, taggerCount)
+	local regularPlayers = {}
+
+	debugLog("DEBUG: Calculated " .. taggerCount .. " taggers for " .. #players .. " players")
+	debugLog("DEBUG: Selected taggers:")
+	for i, tagger in pairs(taggers) do
+		debugLog("  - " .. tagger.Name)
+	end
+
+	for _, player in pairs(players) do
+		local isTagger = false
+		for _, tagger in pairs(taggers) do
+			if player == tagger then
+				isTagger = true
+				break
+			end
+		end
+		if not isTagger then
+			table.insert(regularPlayers, player)
+		end
+	end
+
+	debugLog("DEBUG: Regular players:")
+	for i, player in pairs(regularPlayers) do
+		debugLog("  - " .. player.Name)
+	end
+
+	-- Assign to teams
+	local TeamsService = require(script.Parent.Parent.TeamsService)
+	local LoadoutService = require(script.Parent.Parent.LoadoutService)
+	local TagEffects = require(script.Parent.Parent.TagEffects)
+	local TagService = require(script.Parent.Parent.TagService)
+
+	debugLog("DEBUG: About to assign taggers to TeamsService")
+	TeamsService.AssignTaggers(taggers)
+	debugLog("DEBUG: About to assign players to TeamsService")
+	TeamsService.AssignPlayers(regularPlayers)
+
+	-- Verify the assignments worked
+	debugLog("DEBUG: Verifying team assignments:")
+	for _, player in pairs(players) do
+		local assignedRole = TeamsService.GetPlayerRole(player)
+		debugLog("  " .. player.Name .. " assigned role: " .. tostring(assignedRole))
+	end
+
+	-- Give tools
+	if FreezeTag.Config.GiveTaggerTool then
+		for _, tagger in pairs(taggers) do
+			LoadoutService.GiveTagTool(tagger)
+		end
+	end
+
+	-- Remove tools from players
+	for _, player in pairs(regularPlayers) do
+		LoadoutService.RemoveTool(player, Cfg("Tagging.ToolName"))
+	end
+
+	-- Unfreeze everyone
+	for _, player in pairs(players) do
+		TagEffects.Unfreeze(player)
+	end
+
+	-- IMPORTANT: Subscribe to tag events
+	local TagService = require(script.Parent.Parent.TagService)
+	local tagConnection = nil
+
+	if TagService.Tagged then
+		tagConnection = TagService.Tagged:Connect(function(shooter, target, payload)
+			FreezeTag:OnTag(shooter, target)
+		end)
+	else
+		warn("TagService.Tagged event not available - tags may not work properly")
+	end
+
+	-- Start rescue checking loop
+	rescueConnection = RunService.Heartbeat:Connect(function()
+		if not roundActive then
+			rescueConnection:Disconnect()
+			rescueConnection = nil
+			-- Also disconnect tag events when match ends
+			if tagConnection then
+				tagConnection:Disconnect()
+			end
+			return
+		end
+		updateRescueTimers()
+		checkRescueProximity()
+	end)
+
+	debugLog("Match started: " .. #taggers .. " taggers, " .. #regularPlayers .. " players")
+
+	-- Note: HUD updates would be handled via RemoteEvents to clients if needed
+end
+
+-- Mode interface implementation
+function FreezeTag:OnMatchStart(players: {Player})
+	local freshPlayers = getAllPlayers()
+
+	if #freshPlayers >= (FreezeTag.Config.MinPlayersToStart or 3) then
+		startMatchInternal(freshPlayers)
+	else
+		debugLog("Waiting for more players...")
+		waitingForPlayers = true
+	end
+end
+
+function FreezeTag:OnMatchEnd(state: table?)
+	roundActive = false
+	waitingForPlayers = false
+	rescueTimers = {}
+
+	if rescueConnection then
+		rescueConnection:Disconnect()
+		rescueConnection = nil
+	end
+
+	if state and state.winner then
+		debugLog(state.winner .. " won! " .. (state.reason or ""))
+	end
+end
+
+function FreezeTag:OnTimeUp()
+	local unfrozenCount = getUnfrozenPlayerCount()
+
+	if unfrozenCount > 0 then
+		FreezeTag:OnMatchEnd({winner = "Players", reason = unfrozenCount .. " players survived"})
+	else
+		FreezeTag:OnMatchEnd({winner = "Taggers", reason = "All players frozen"})
+	end
+end
+
+function FreezeTag:OnPlayerAdded(player: Player)
+	debugLog("Player added: " .. player.Name)
+
+	-- Only start match if we're not already in a match and not waiting
+	if not waitingForPlayers and not roundActive then
+		local GameDirector = require(game:GetService("ServerScriptService").Modules.GameDirector)
+
+		-- Only start if we're in lobby state (prevents duplicate starts during match)
+		if GameDirector.GetState() == GameDirector.States.Lobby then
+			local currentPlayers = getAllPlayers()
+			if #currentPlayers >= (FreezeTag.Config.MinPlayersToStart or 3) then
+				startMatchInternal(currentPlayers)
+			end
+		end
+	end
+end
+
+function FreezeTag:OnPlayerRemoving(player: Player)
+	-- Clean up rescue timers involving this player
+	local toRemove = {}
+	for key, rescueData in pairs(rescueTimers) do
+		if rescueData.rescuer == player or rescueData.frozen == player then
+			table.insert(toRemove, key)
+		end
+	end
+	for _, key in pairs(toRemove) do
+		rescueTimers[key] = nil
+	end
+
+	-- Check win conditions after player leaves
+	if roundActive then
+		task.wait(0.1)
+		checkWinConditions()
+	end
+end
+
+function FreezeTag:OnTag(shooter: Player, target: Player)
+	if not roundActive then return end
+
+	local TeamsService = require(script.Parent.Parent.TeamsService)
+	local TagEffects = require(script.Parent.Parent.TagEffects)
+
+	-- Validate tag
+	if TeamsService.GetPlayerRole(shooter) ~= "Tagger" then return end
+	if TeamsService.GetPlayerRole(target) ~= "Player" then return end
+	if TagEffects.IsFrozen(target) then return end
+
+	-- Freeze target
+	TagEffects.Freeze(target)
+	debugLog(shooter.Name .. " froze " .. target.Name)
+
+	-- Check win conditions
+	checkWinConditions()
+end
+
+function FreezeTag:OnCharacterAdded(player: Player, character: Model)
+	task.wait(0.1) -- Allow team assignment
+
+	local TeamsService = require(script.Parent.Parent.TeamsService)
+	local LoadoutService = require(script.Parent.Parent.LoadoutService)
+
+	if TeamsService.GetPlayerRole(player) == "Tagger" and FreezeTag.Config.GiveTaggerTool then
+		LoadoutService.GiveTagTool(player)
+	end
+end
+
+return FreezeTag
