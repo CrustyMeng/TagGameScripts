@@ -1,0 +1,137 @@
+-- ReplicatedStorage/Modules/Game/TagEffects.lua
+-- Freeze/unfreeze player effects (merged from FrozenState.lua)
+
+local Players = game:GetService("Players")
+
+local GameConfig = require(script.Parent.GameConfig)
+
+local TagEffects = {}
+
+-- Track frozen players and their original values
+local frozenPlayers: {[Player]: {walkSpeed: number, jumpPower: number}} = {}
+
+-- Debug logging
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "Mode:FreezeTag") then
+		print("[Mode:FreezeTag] " .. message)
+	end
+end
+
+-- Apply movement lock to a character
+local function applyMovementLock(character: Model, enable: boolean)
+	if not character then return end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid then return end
+
+	if enable then
+		-- Store original values
+		if humanoid:GetAttribute("OriginalWalkSpeed") == nil then
+			humanoid:SetAttribute("OriginalWalkSpeed", humanoid.WalkSpeed)
+		end
+		if humanoid:GetAttribute("OriginalJumpPower") == nil then
+			humanoid:SetAttribute("OriginalJumpPower", humanoid.JumpPower)
+		end
+
+		-- Apply freeze
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+
+		-- Visual indicator for clients
+		local frozenValue = character:FindFirstChild("IsFrozen")
+		if not frozenValue then
+			frozenValue = Instance.new("BoolValue")
+			frozenValue.Name = "IsFrozen"
+			frozenValue.Parent = character
+		end
+		frozenValue.Value = true
+
+		-- Anchor for extra security if configured
+		if rootPart and GameConfig.FreezeTag.FreezeMovement then
+			rootPart.Anchored = true
+		end
+	else
+		-- Restore movement
+		local originalWalkSpeed = humanoid:GetAttribute("OriginalWalkSpeed")
+		local originalJumpPower = humanoid:GetAttribute("OriginalJumpPower")
+
+		humanoid.WalkSpeed = originalWalkSpeed or 16  -- Default fallback
+		humanoid.JumpPower = originalJumpPower or 50  -- Default fallback
+
+		humanoid:SetAttribute("OriginalWalkSpeed", nil)
+		humanoid:SetAttribute("OriginalJumpPower", nil)
+
+		-- Remove frozen indicator
+		local frozenValue = character:FindFirstChild("IsFrozen")
+		if frozenValue then
+			frozenValue:Destroy()
+		end
+
+		-- Unanchor
+		if rootPart then
+			rootPart.Anchored = false
+		end
+	end
+end
+
+-- Freeze a player
+function TagEffects.Freeze(player: Player)
+	if not player or not player.Parent then return end
+
+	frozenPlayers[player] = {}
+	debugLog("Froze " .. player.Name)
+
+	if player.Character then
+		applyMovementLock(player.Character, true)
+	end
+end
+
+-- Unfreeze a player
+function TagEffects.Unfreeze(player: Player)
+	if not player or not player.Parent then return end
+
+	if frozenPlayers[player] then
+		frozenPlayers[player] = nil
+		debugLog("Unfroze " .. player.Name)
+
+		if player.Character then
+			applyMovementLock(player.Character, false)
+		end
+	end
+end
+
+-- Check if player is frozen
+function TagEffects.IsFrozen(player: Player): boolean
+	return frozenPlayers[player] ~= nil
+end
+
+-- Unfreeze all players
+function TagEffects.UnfreezeAll()
+	for player, _ in pairs(frozenPlayers) do
+		TagEffects.Unfreeze(player)
+	end
+	debugLog("Unfroze all players")
+end
+
+-- Handle respawn - reapply frozen state
+local function onCharacterAdded(player: Player)
+	if TagEffects.IsFrozen(player) then
+		task.wait(0.1) -- Ensure character is loaded
+		applyMovementLock(player.Character, true)
+	end
+end
+
+-- Set up event handlers
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		onCharacterAdded(player)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	frozenPlayers[player] = nil
+end)
+
+return TagEffects
