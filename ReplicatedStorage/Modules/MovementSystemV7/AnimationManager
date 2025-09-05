@@ -1,0 +1,151 @@
+-- UPDATED: AnimationManager.txt — removed WallCling and Vault animation loading
+
+-- Handles animation loading and playback
+-- Game.ReplicatedStorage.Modules.MovementSystemV7.AnimationManager (ModuleScript)
+
+local AnimationManager = {}
+local Config = require(script.Parent.Config)
+
+-- Store loaded animations per character
+local characterAnimations = {}
+
+-- Small no-op track so controller logic never crashes if an anim id is 0
+local function makeDummyTrack()
+	local playing = false
+	local signal = Instance.new("BindableEvent")
+
+	local dummy = {}
+	function dummy:Play(_fadeTime) playing = true end
+	function dummy:Stop(_fadeTime) playing = false end
+	function dummy:AdjustSpeed(_speed) end
+	function dummy:GetMarkerReachedSignal(_markerName) return signal.Event end
+
+	return setmetatable(dummy, {
+		__index = function(_, k)
+			if k == "IsPlaying" then
+				return playing
+			end
+		end,
+	})
+end
+
+-- Load animations for a character once and cache the tracks
+function AnimationManager:LoadAnimations(character)
+	if characterAnimations[character] then
+		return characterAnimations[character]
+	end
+
+	local humanoid = character:WaitForChild("Humanoid")
+	local animator = humanoid:WaitForChild("Animator")
+
+	local animations = {}
+
+	-- Sprint
+	if Config.Animations.Sprint ~= "rbxassetid://0" then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = Config.Animations.Sprint
+		animations.Sprint = animator:LoadAnimation(anim)
+	end
+
+	-- Dash (Front/Back/Left/Right)
+	animations.Dash = {}
+	for dir, id in pairs(Config.Animations.Dash) do
+		if id ~= "rbxassetid://0" then
+			local anim = Instance.new("Animation")
+			anim.AnimationId = id
+			animations.Dash[dir] = animator:LoadAnimation(anim)
+		end
+	end
+
+	-- AirJump
+	if Config.Animations.AirJump ~= "rbxassetid://0" then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = Config.Animations.AirJump
+		animations.AirJump = animator:LoadAnimation(anim)
+	end
+
+	-- WallRun (Left/Right/LeapLeft/LeapRight)
+	animations.WallRun = {}
+	for key, id in pairs(Config.Animations.WallRun) do
+		if id ~= "rbxassetid://0" then
+			local anim = Instance.new("Animation")
+			anim.AnimationId = id
+			animations.WallRun[key] = animator:LoadAnimation(anim)
+		end
+	end
+
+	-- Land
+	if Config.Animations.Land ~= "rbxassetid://0" then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = Config.Animations.Land
+		animations.Land = animator:LoadAnimation(anim)
+	end
+
+	characterAnimations[character] = animations
+	return animations
+end
+
+-- Play an animation by type (and optional subtype), returns a track (dummy if missing)
+function AnimationManager:PlayAnimation(character, animType, subType, speed, fadeTime)
+	local animations = self:LoadAnimations(character)
+	local track
+
+	if subType then
+		if animations[animType] then
+			track = animations[animType][subType]
+		end
+	else
+		track = animations[animType]
+	end
+
+	if track then
+		track:Play(fadeTime or 0.1)
+		if speed then track:AdjustSpeed(speed) end
+		return track
+	end
+
+	-- No track cached => return dummy so callers can still :Stop(), :AdjustSpeed(), etc.
+	return makeDummyTrack()
+end
+
+-- Stop a specific animation if it's playing
+function AnimationManager:StopAnimation(character, animType, subType, fadeTime)
+	local animations = characterAnimations[character]
+	if not animations then return end
+
+	local track
+	if subType then
+		if animations[animType] then
+			track = animations[animType][subType]
+		end
+	else
+		track = animations[animType]
+	end
+
+	if track and track.IsPlaying then
+		track:Stop(fadeTime or 0.1)
+	end
+end
+
+-- Stop every currently playing track on the Humanoid's Animator
+function AnimationManager:StopAllAnimations(character, fadeTime)
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	local animator = humanoid:FindFirstChild("Animator")
+	if not animator then return end
+
+	for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+		t:Stop(fadeTime or 0)
+	end
+end
+
+-- Cleanup cache when a player leaves
+game.Players.PlayerRemoving:Connect(function(player)
+	local char = player.Character
+	if char and characterAnimations[char] then
+		characterAnimations[char] = nil
+	end
+end)
+
+return AnimationManager
