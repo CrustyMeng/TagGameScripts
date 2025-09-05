@@ -1,0 +1,104 @@
+	-- Adds character tilting based on movement
+  -- CharacterTilt (this is a LocalScript)
+
+	local RunService = game:GetService("RunService")
+	local Players = game:GetService("Players")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+	local Config = require(ReplicatedStorage.Modules.MovementSystemV7.Config)
+	local StateManager = require(ReplicatedStorage.Modules.MovementSystemV7.StateManager)
+
+	local player = Players.LocalPlayer
+	local character = player.Character or player.CharacterAdded:Wait()
+	local humanoid = character:WaitForChild("Humanoid")
+	local rootPart = character:WaitForChild("HumanoidRootPart")
+	local lowerTorso = character:WaitForChild("LowerTorso")
+
+	-- Joints (Root on R15; fallback to R6 RootJoint if present)
+	local rootJoint = lowerTorso:FindFirstChild("Root") or rootPart:FindFirstChild("RootJoint")
+	local leftHip = lowerTorso:FindFirstChild("LeftHip")
+	local rightHip = lowerTorso:FindFirstChild("RightHip")
+
+	-- Originals
+	local rootJointC0 = rootJoint and rootJoint.C0 or CFrame.new()
+	local leftHipC0 = leftHip and leftHip.C0 or CFrame.new()
+	local rightHipC0 = rightHip and rightHip.C0 or CFrame.new()
+
+	local baseMaxTilt = math.rad(Config.MaxTiltAngle or 10)
+
+	-- Per-frame tilt update
+	local function updateTilt(dt)
+		if not (rootPart and rootJoint) then return end
+
+		-- Sprint-aware tilt scaling
+		local isSprinting = StateManager:HasState(character, "Sprinting")
+		local mult = isSprinting and (Config.Tilt and Config.Tilt.SprintMultiplier or 1)
+			or (Config.Tilt and Config.Tilt.WalkMultiplier or 0.4)
+		local maxTiltNow = baseMaxTilt * mult
+
+		local horizVel = Vector3.new(rootPart.Velocity.X, 0, rootPart.Velocity.Z)
+		local vMag = horizVel.Magnitude
+
+		local sideDot, fwdDot = 0, 0
+		if vMag > 2 then
+			local dir = horizVel.Unit
+			sideDot = rootPart.CFrame.RightVector:Dot(dir)
+			fwdDot = rootPart.CFrame.LookVector:Dot(dir)
+		end
+
+		-- Per-axis multipliers
+		local sideMult = (Config.Tilt and Config.Tilt.SideMultiplier) or 1.35
+		local fwdMult  = (Config.Tilt and Config.Tilt.ForwardMultiplier) or 1.0
+
+		local tiltSide = sideDot * maxTiltNow * sideMult
+		local tiltFwd  = -fwdDot * maxTiltNow * fwdMult -- negative so forward motion leans forward
+
+		-- Smooth lerp scale
+		local lerpSpeed = (Config.Tilt and Config.Tilt.LerpSpeed) or 12
+		local alpha = math.clamp(dt * lerpSpeed, 0, 1)
+
+		-- Apply: pitch = X from forward, roll = Z from side (banking feels stronger)
+		rootJoint.C0 = rootJoint.C0:Lerp(rootJointC0 * CFrame.Angles(tiltFwd, 0, -tiltSide), alpha)
+
+		-- Optional hip accent (subtle)
+		if leftHip then
+			leftHip.C0 = leftHip.C0:Lerp(leftHipC0 * CFrame.Angles(tiltSide * 0.5, 0, 0), alpha)
+		end
+		if rightHip then
+			rightHip.C0 = rightHip.C0:Lerp(rightHipC0 * CFrame.Angles(-tiltSide * 0.5, 0, 0), alpha)
+		end
+	end
+
+	-- Respawn-safe wiring
+	local connection
+	local function bind()
+		if connection then connection:Disconnect() end
+		connection = RunService.RenderStepped:Connect(updateTilt)
+	end
+
+	local function rebindForCharacter(newChar)
+		if connection then connection:Disconnect() end
+
+		character = newChar
+		humanoid = character:WaitForChild("Humanoid")
+		rootPart = character:WaitForChild("HumanoidRootPart")
+		lowerTorso = character:WaitForChild("LowerTorso")
+
+		rootJoint = lowerTorso:FindFirstChild("Root") or rootPart:FindFirstChild("RootJoint")
+		leftHip = lowerTorso:FindFirstChild("LeftHip")
+		rightHip = lowerTorso:FindFirstChild("RightHip")
+
+		if not rootJoint then
+			warn("[CharacterTilt] No Root/RootJoint found; check rig type.")
+			return
+		end
+
+		rootJointC0 = rootJoint.C0
+		leftHipC0 = leftHip and leftHip.C0 or CFrame.new()
+		rightHipC0 = rightHip and rightHip.C0 or CFrame.new()
+
+		bind()
+	end
+
+	bind()
+	player.CharacterAdded:Connect(rebindForCharacter)
