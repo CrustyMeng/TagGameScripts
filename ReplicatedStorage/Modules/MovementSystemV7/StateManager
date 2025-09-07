@@ -1,0 +1,74 @@
+-- UPDATED: StateManager.txt — removed WallClung and Vaulting states
+
+-- Handles character state tracking
+-- Game.ReplicatedStorage.Modules.MovementSystemV7.StateManager (this is a module script)
+
+local StateManager = {}
+
+-- Store states per character
+local characterStates = {}
+
+function StateManager:GetStates(character)
+	if not characterStates[character] then
+		characterStates[character] = {
+			Sprinting = false,
+			Dashing = false,
+			AirJumping = false,
+			WallRunning = false,
+			Landing = false
+		}
+	end
+	return characterStates[character]
+end
+
+function StateManager:HasState(character, stateName)
+	local states = self:GetStates(character)
+	return states[stateName] == true
+end
+
+function StateManager:AddState(character, stateName, duration)
+	local states = self:GetStates(character)
+	states[stateName] = true
+
+	if duration then
+		task.delay(duration, function()
+			states[stateName] = false
+		end)
+	end
+end
+
+function StateManager:RemoveState(character, stateName)
+	local states = self:GetStates(character)
+	states[stateName] = false
+end
+
+function StateManager:CanPerformAction(character, action)
+	local states = self:GetStates(character)
+
+	-- Define blocking states for each action
+	local blockingStates = {
+		Sprint    = {"Dashing", "AirJumping", "WallRunning", "Landing"},
+		Dash      = {"Dashing", "AirJumping", "WallRunning", "Landing"},
+		AirJump   = {"Dashing", "WallRunning", "Landing"},
+		-- Allow WallRun during brief Landing so coyote/ground-jump starts feel responsive
+		WallRun   = {"Dashing", "AirJumping", "WallRunning"},
+	}
+
+	local blockers = blockingStates[action] or {}
+	for _, state in pairs(blockers) do
+		if states[state] then
+			return false
+		end
+	end
+	return true
+end
+
+
+-- Cleanup when character leaves
+game.Players.PlayerRemoving:Connect(function(player)
+	if player.Character and characterStates[player.Character] then
+		characterStates[player.Character] = nil
+	end
+end)
+
+return StateManager
