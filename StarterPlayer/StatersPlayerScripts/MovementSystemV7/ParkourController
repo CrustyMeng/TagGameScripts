@@ -1,0 +1,1190 @@
+-- Main parkour system controller with hitbox integration
+-- Game.ReplicatedStorage.Modules.MovementSystemV7.ParkourController (this is a LocalScript)
+
+local ParkourController = {}
+
+-- Services
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Modules
+local Config = require(ReplicatedStorage.Modules.MovementSystemV7.Config)
+local StateManager = require(ReplicatedStorage.Modules.MovementSystemV7.StateManager)
+local CooldownManager = require(ReplicatedStorage.Modules.MovementSystemV7.CooldownManager)
+local RaycastUtil = require(ReplicatedStorage.Modules.Shared.Movement.RaycastUtil)
+local VelocityHandler = require(ReplicatedStorage.Modules.MovementSystemV7.VelocityHandler)
+local AnimationManager = require(ReplicatedStorage.Modules.MovementSystemV7.AnimationManager)
+local HitboxManager = require(ReplicatedStorage.Modules.MovementSystemV7.HitboxManager)
+local HitboxVisualizer = require(ReplicatedStorage.Modules.MovementSystemV7.HitboxVisualizer)
+
+-- Player and Character references
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local rootPart = character:WaitForChild("HumanoidRootPart")
+local camera = workspace.CurrentCamera
+
+-- Hitbox reference
+local hitbox = nil
+
+-- State variables
+local airJumpUses = Config.AirJumpUses
+local wallRunUses = Config.WallRunUses
+local connections = {}
+local currentWallRunDirection = 0
+local lastFreefallStart = -1 -- for coyote time
+
+-- Wall-run lifecycle guard (so old runs can't linger)
+local currentWallRunStop = nil
+
+-- Initialize the system
+function ParkourController:Init()
+	self:SetupCharacterStats()
+	self:SetupHitbox()
+	self:ConnectInputs()
+	self:ConnectHumanoidEvents()
+	self:StartUpdateLoop()
+
+	-- Load animations
+	AnimationManager:LoadAnimations(character)
+end
+
+function ParkourController:SetupHitbox()
+	-- Attach hitbox to character
+	hitbox = HitboxManager:Attach(character)
+
+	-- Debug: Check if hitbox was created
+	if hitbox then
+		print("Hitbox created successfully:", hitbox.Name, "Size:", hitbox.Size, "Position:", hitbox.Position)
+	else
+		print("ERROR: Hitbox not created!")
+	end
+
+	-- Enable visualization if configured
+	if Config.Hitbox.Visualize then
+		HitboxVisualizer:Toggle(player, true)
+	end
+end
+
+function ParkourController:SetupCharacterStats()
+	humanoid.WalkSpeed = Config.BaseSpeed
+	humanoid.JumpHeight = Config.BaseJumpHeight
+
+	-- Set camera FOV
+	TweenService:Create(camera, TweenInfo.new(0.5, Enum.EasingStyle.Quint), {
+		FieldOfView = Config.BaseFOV
+	}):Play()
+end
+
+function ParkourController:ConnectInputs()
+	connections.inputBegan = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then return end
+		self:HandleInputBegan(input)
+	end)
+
+	connections.inputEnded = UserInputService.InputEnded:Connect(function(input, gameProcessed)
+		if gameProcessed then return end
+		self:HandleInputEnded(input)
+	end)
+end
+
+function ParkourController:HandleInputBegan(input)
+	local keyCode = input.KeyCode
+
+	-- HOLD-TO-SPRINT (works in any direction)
+	if keyCode == Config.Keybinds.Sprint then
+		self:StartSprint()
+	end
+
+	-- Dash
+	if keyCode == Config.Keybinds.Dash then
+		self:AttemptDash()
+	end
+
+	-- Space actions (reordered priority)
+	if keyCode == Config.Keybinds.AirJump then
+		-- If already on a wall-run, use their specific actions
+		if StateManager:HasState(character, "WallRunning") then
+			self:AttemptWallRunLeap()
+			return
+		end
+
+		-- Airborne: try to wall-run first, then fall back to air-jump
+		if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+			if self:AttemptWallRun() then return end
+			self:AttemptAirJump()
+			return
+		end
+
+		-- Grounded press: allow coyote-time wall-run attempt (won't start unless rays hit)
+		self:AttemptWallRun()
+	end
+end
+
+function ParkourController:HandleInputEnded(input)
+	local keyCode = input.KeyCode
+
+	-- Stop sprint only when Sprint key is released
+	if keyCode == Config.Keybinds.Sprint then
+		self:StopSprint()
+	end
+end
+
+function ParkourController:ConnectHumanoidEvents()
+	connections.stateChanged = humanoid.StateChanged:Connect(function(oldState, newState)
+		self:HandleStateChange(oldState, newState)
+	end)
+end
+
+function ParkourController:HandleStateChange(oldState, newState)
+	-- Log coyote time tracking when entering freefall
+	if newState == Enum.HumanoidStateType.Freefall then
+		lastFreefallStart = tick()
+		local delta = tick() - lastFreefallStart
+		print("[DEBUG] Entering Freefall - Coyote timer started, delta:", delta)
+	end
+
+	-- Normal land handling
+	if newState == Enum.HumanoidStateType.Landed then
+		self:OnLanded()
+	end
+end
+
+function ParkourController:OnLanded()
+	airJumpUses = Config.AirJumpUses
+	wallRunUses = Config.WallRunUses
+
+	AnimationManager:PlayAnimation(character, "Land", nil, 3, 0.1)
+	StateManager:AddState(character, "Landing", 0.2)
+
+	if StateManager:HasState(character, "Sprinting") then
+		AnimationManager:PlayAnimation(character, "Sprint", nil, 1, 0.1)
+	end
+
+	-- NEW: make absolutely sure movement values are sane after touching ground
+	self:RestoreMovementDefaults()
+end
+
+
+-- SPRINT SYSTEM (hold-to-sprint)
+function ParkourController:StartSprint()
+	if not StateManager:CanPerformAction(character, "Sprint") then return end
+	if StateManager:HasState(character, "Sprinting") then return end
+
+	StateManager:AddState(character, "Sprinting")
+	humanoid.WalkSpeed = Config.RunningSpeed
+	humanoid.JumpHeight = Config.RunningJumpHeight
+
+	AnimationManager:PlayAnimation(character, "Sprint", nil, 1, 0.45)
+	self:StartSprintMonitoring()
+end
+
+function ParkourController:StopSprint()
+	if not StateManager:HasState(character, "Sprinting") then return end
+
+	StateManager:RemoveState(character, "Sprinting")
+	humanoid.WalkSpeed = Config.BaseSpeed
+	humanoid.JumpHeight = Config.BaseJumpHeight
+
+	AnimationManager:StopAnimation(character, "Sprint", nil, 0.2)
+
+	if connections.sprintMonitor then
+		connections.sprintMonitor:Disconnect()
+		connections.sprintMonitor = nil
+	end
+end
+
+function ParkourController:StartSprintMonitoring()
+	if connections.sprintMonitor then
+		connections.sprintMonitor:Disconnect()
+	end
+
+	connections.sprintMonitor = RunService.RenderStepped:Connect(function()
+		if not StateManager:HasState(character, "Sprinting") then return end
+
+		local moving = humanoid.MoveDirection.Magnitude > 0
+		local sprintTrack = AnimationManager:LoadAnimations(character).Sprint
+
+		if sprintTrack then
+			if not moving and sprintTrack.IsPlaying then
+				sprintTrack:Stop()
+			elseif moving and not sprintTrack.IsPlaying then
+				sprintTrack:Play(0.45)
+			end
+
+			if humanoid:GetState() == Enum.HumanoidStateType.Freefall
+				or humanoid:GetState() == Enum.HumanoidStateType.Jumping then
+				sprintTrack:AdjustSpeed(0.125)
+			else
+				sprintTrack:AdjustSpeed(1)
+			end
+		end
+	end)
+end
+
+-- DASH SYSTEM (updated to use hitbox for collision detection)
+function ParkourController:AttemptDash()
+	if not StateManager:CanPerformAction(character, "Dash") then return end
+	if not CooldownManager:IsReady("Dash") then return end
+
+	local direction = self:GetDashDirection()
+	self:ExecuteDash(direction)
+end
+
+function ParkourController:GetDashDirection()
+	local moveDirection = rootPart.CFrame:VectorToObjectSpace(humanoid.MoveDirection)
+
+	if moveDirection.Magnitude <= 0 then
+		return "Front"
+	end
+
+	if math.abs(moveDirection.X) > math.abs(moveDirection.Z) then
+		return moveDirection.X < 0 and "Left" or "Right"
+	else
+		return moveDirection.Z < 0 and "Front" or "Back"
+	end
+end
+
+function ParkourController:ExecuteDash(direction)
+	-- Duration by direction
+	local duration = Config.FrontDashDuration
+	if direction == "Left" or direction == "Right" then
+		duration = Config.SideDashDuration
+	elseif direction == "Back" then
+		duration = Config.BackDashDuration
+	end
+
+	StateManager:AddState(character, "Dashing", duration)
+	CooldownManager:Apply("Dash", Config.DashCooldown)
+
+	AnimationManager:StopAllAnimations(character, 0)
+	AnimationManager:PlayAnimation(character, "Dash", direction, 1, 0)
+	self:PlaySound(Config.Sounds.Dash, rootPart, 1.25)
+
+	-- Temporary camera-relative rotation during dash
+	local gameSettings = UserSettings().GameSettings
+	gameSettings.RotationType = Enum.RotationType.CameraRelative
+	task.delay(duration, function()
+		-- Fallback restore if we didn't stop early
+		gameSettings.RotationType = Enum.RotationType.MovementRelative
+	end)
+
+	-- Track ground contact parts (so we can tweak friction briefly)
+	local isGrounded = humanoid.FloorMaterial ~= Enum.Material.Air
+	local savedProps = {}
+	local contactParts = {}
+
+	if isGrounded then
+		local lf = character:FindFirstChild("LeftFoot", true)
+		local rf = character:FindFirstChild("RightFoot", true)
+		local lll = character:FindFirstChild("LeftLowerLeg", true)
+		local rll = character:FindFirstChild("RightLowerLeg", true)
+		table.insert(contactParts, lf or lll or rootPart)
+		table.insert(contactParts, rf or rll or rootPart)
+
+		-- de-dup & filter
+		local seen, filtered = {}, {}
+		for _, p in ipairs(contactParts) do
+			if typeof(p) == "Instance" and p:IsA("BasePart") and not seen[p] then
+				seen[p] = true
+				table.insert(filtered, p)
+			end
+		end
+		contactParts = filtered
+
+		for _, part in ipairs(contactParts) do
+			savedProps[part] = part.CustomPhysicalProperties
+			part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0, 0, 100, 100)
+		end
+	end
+
+	-- Create the force
+	local dashDirection = self:GetDashDirectionVector(direction)
+	local velocity, speedValue = VelocityHandler:CreateDashVelocity(rootPart, dashDirection, Config.DashSpeed, duration)
+
+	local isAir = humanoid:GetState() == Enum.HumanoidStateType.Freefall
+		or humanoid:GetState() == Enum.HumanoidStateType.Jumping
+
+	if isAir and velocity then
+		velocity.ForceLimitsEnabled = false
+		local max = velocity.MaxAxesForce
+		velocity.MaxAxesForce = Vector3.new(max.X * 1.25, 0, max.Z * 1.25)
+	end
+
+	if isGrounded and velocity then
+		velocity.ForceLimitsEnabled = false
+	end
+
+	humanoid.JumpHeight = 0
+
+	-- Speed shaping
+	if direction == "Front" then
+		task.delay(duration * 0.1, function()
+			if speedValue then
+				TweenService:Create(speedValue, TweenInfo.new(duration * 0.15), {Value = Config.DashSpeed * 1.35}):Play()
+				task.wait(duration * 0.4)
+				if speedValue then
+					TweenService:Create(speedValue, TweenInfo.new(duration * 0.25), {Value = Config.DashSpeed / 1.25}):Play()
+				end
+			end
+		end)
+	elseif direction == "Left" or direction == "Right" then
+		TweenService:Create(speedValue, TweenInfo.new(duration * 0.25), {Value = Config.DashSpeed * 1.2}):Play()
+		task.delay(duration * 0.25, function()
+			if speedValue then
+				TweenService:Create(speedValue, TweenInfo.new(duration * 0.75), {Value = Config.DashSpeed * 0.9}):Play()
+			end
+		end)
+	else -- Back
+		task.delay(duration / 2, function()
+			if speedValue then
+				TweenService:Create(speedValue, TweenInfo.new(duration / 2), {Value = Config.DashSpeed + 5}):Play()
+			end
+		end)
+	end
+
+	-- NEW: start dash collision monitor for auto-attach (using hitbox)
+	self:StartDashMonitor(velocity, speedValue, direction, savedProps, isGrounded, gameSettings)
+
+	-- Normal end-of-dash cleanup (also runs if we never collide)
+	task.delay(duration, function()
+		-- Restore foot/leg physical properties if we altered them and they still exist
+		if isGrounded then
+			for part, props in pairs(savedProps) do
+				if part and part.Parent then
+					part.CustomPhysicalProperties = props
+				end
+			end
+		end
+
+		if StateManager:HasState(character, "Sprinting") then
+			humanoid.WalkSpeed = Config.RunningSpeed
+			humanoid.JumpHeight = Config.RunningJumpHeight
+		else
+			humanoid.WalkSpeed = Config.BaseSpeed
+			humanoid.JumpHeight = Config.BaseJumpHeight
+		end
+	end)
+end
+
+-- Determine axis name for raycasting based on dash direction
+function ParkourController:_dashAxisFromDirection(direction)
+	if direction == "Front" then return "Forward" end
+	if direction == "Back" then return "Backward" end
+	if direction == "Left" then return "Left" end
+	if direction == "Right" then return "Right" end
+	return "Forward"
+end
+
+-- Per-frame collision checking during dash; on hit → stop dash and auto-attach (using hitbox)
+function ParkourController:StartDashMonitor(velocity, speedValue, direction, savedProps, isGrounded, gameSettings)
+	-- Kill any previous monitor just in case
+	if connections.dashMonitor then
+		connections.dashMonitor:Disconnect()
+		connections.dashMonitor = nil
+	end
+
+	local axis = self:_dashAxisFromDirection(direction)
+	local ended = false
+
+	connections.dashMonitor = RunService.Heartbeat:Connect(function()
+		if ended then return end
+		-- If we somehow lost the velocity mover, stop monitoring
+		if not velocity or not velocity.Parent then
+			if connections.dashMonitor then connections.dashMonitor:Disconnect() end
+			connections.dashMonitor = nil
+			return
+		end
+
+		-- Short probe ray from hitbox in dash axis
+		local hit = RaycastUtil:Cast(hitbox, axis, Config.DashCollisionProbe, {
+			blacklist = {character},
+			visualize = Config.VisualizeRaycasts
+		})
+
+		if hit and hit.Hit and hit.Hit.CanCollide and hit.Hit.Name ~= "RaycastVisual" then
+			ended = true
+
+			-- Hard stop dash immediately
+			self:StopDashEarly(velocity, speedValue, savedProps, isGrounded, gameSettings)
+
+			-- Try to auto-attach based on facing vs wall normal
+			self:TryAutoWallAttach(hit)
+		end
+	end)
+end
+
+-- Stop the dash NOW (used by dash monitor when colliding)
+function ParkourController:StopDashEarly(velocity, speedValue, savedProps, isGrounded, gameSettings)
+	-- Stop per-frame monitor
+	if connections.dashMonitor then
+		connections.dashMonitor:Disconnect()
+		connections.dashMonitor = nil
+	end
+
+	-- Destroy movers
+	if speedValue then speedValue:Destroy() end
+	if velocity then velocity:Destroy() end
+	VelocityHandler:ClearMovers(rootPart)
+
+	-- Restore rotation mode immediately
+	if gameSettings then
+		gameSettings.RotationType = Enum.RotationType.MovementRelative
+	end
+
+	-- Clear dash state
+	StateManager:RemoveState(character, "Dashing")
+
+	-- Restore foot/leg physical properties if we altered them and they still exist
+	if isGrounded then
+		for part, props in pairs(savedProps or {}) do
+			if part and part.Parent then
+				part.CustomPhysicalProperties = props
+			end
+		end
+	end
+
+	-- Restore movement (respect sprint)
+	if StateManager:HasState(character, "Sprinting") then
+		humanoid.WalkSpeed = Config.RunningSpeed
+		humanoid.JumpHeight = Config.RunningJumpHeight
+	else
+		humanoid.WalkSpeed = Config.BaseSpeed
+		humanoid.JumpHeight = Config.BaseJumpHeight
+	end
+end
+
+-- Run-only auto-attach (no more cling logic)
+function ParkourController:TryAutoWallAttach(wallResult)
+	-- Check if wall-run sector gate passes
+	local runOk, runDir, runNormal = self:ShouldStartWallRunBySector()
+
+	if runOk then
+		self:ExecuteWallRun(runDir, runNormal)
+	end
+end
+
+-- === Sector math helpers (XZ-plane) =========================================
+local function _unitXZ(v: Vector3)
+	local f = Vector3.new(v.X, 0, v.Z)
+	local m = f.Magnitude
+	if m < 1e-3 then return nil end
+	return f / m
+end
+
+local function _signedAngleXZ(uA: Vector3, uB: Vector3)
+	local dot = math.clamp(uA.X*uB.X + uA.Z*uB.Z, -1, 1)
+	local det = uA.X*uB.Z - uA.Z*uB.X
+	return math.deg(math.atan2(det, dot))
+end
+
+local function _chooseBestHit(a, b, origin: Vector3)
+	if a and b then
+		local da = (a.Position - origin).Magnitude
+		local db = (b.Position - origin).Magnitude
+		return (da <= db) and a or b
+	end
+	return a or b
+end
+
+local function _absAngleFromForward(rootCF: CFrame, hitPos: Vector3)
+	local uF = _unitXZ(rootCF.LookVector); if not uF then return 180 end
+	local uH = _unitXZ(hitPos - rootCF.Position); if not uH then return 180 end
+	return math.abs(_signedAngleXZ(uF, uH))
+end
+
+-- Side-sector gate for Wall-Run (uses the RED side rays)
+-- Returns: ok:boolean, wallDir:(1=Right|-1=Left), wallNormal:Vector3, angleAbs:number
+function ParkourController:ShouldStartWallRunBySector()
+	-- Hitbox guard with clear warning
+	if not hitbox or not hitbox.Parent then
+		warn("[WALL RUN] Hitbox not available for wall run detection")
+		return false
+	end
+
+	local cf = hitbox.CFrame
+	local origin = cf.Position
+
+	-- Helpers (local copies so they're self-contained)
+	local function _unitXZ(v: Vector3)
+		local f = Vector3.new(v.X, 0, v.Z)
+		local m = f.Magnitude
+		if m < 1e-3 then return nil end
+		return f / m
+	end
+
+	local function _signedAngleXZ(uA: Vector3, uB: Vector3)
+		local dot = math.clamp(uA.X*uB.X + uA.Z*uB.Z, -1, 1)
+		local det = uA.X*uB.Z - uA.Z*uB.X
+		return math.deg(math.atan2(det, dot))
+	end
+
+	local function _absAngleFromForward(rootCF: CFrame, hitPos: Vector3)
+		local uF = _unitXZ(rootCF.LookVector); if not uF then return 180 end
+		local uH = _unitXZ(hitPos - rootCF.Position); if not uH then return 180 end
+		return math.abs(_signedAngleXZ(uF, uH))
+	end
+
+	local function _chooseBestHit(a, b, o: Vector3)
+		if a and b then
+			local da = (a.Position - o).Magnitude
+			local db = (b.Position - o).Magnitude
+			return (da <= db) and a or b
+		end
+		return a or b
+	end
+
+	local function _angleBetweenNormals(a: Vector3, b: Vector3)
+		local d = math.clamp(a:Dot(b), -1, 1)
+		return math.deg(math.acos(d))
+	end
+
+	-- Dual-height per side (matches the red side rays)
+	local leftLow  = RaycastUtil:Cast(hitbox, "Left",  Config.WallRunDetectionRange, {blacklist = {character}, verticalOffset = 0.0, visualize = Config.VisualizeRaycasts})
+	local leftHigh = RaycastUtil:Cast(hitbox, "Left",  Config.WallRunDetectionRange, {blacklist = {character}, verticalOffset = 1.5, visualize = Config.VisualizeRaycasts})
+	local rightLow = RaycastUtil:Cast(hitbox, "Right", Config.WallRunDetectionRange, {blacklist = {character}, verticalOffset = 0.0, visualize = Config.VisualizeRaycasts})
+	local rightHigh= RaycastUtil:Cast(hitbox, "Right", Config.WallRunDetectionRange, {blacklist = {character}, verticalOffset = 1.5, visualize = Config.VisualizeRaycasts})
+
+	-- Debug which rays hit
+	print("[DEBUG] Wall Run Sector - leftLow:", leftLow and "HIT" or "MISS",
+		"leftHigh:", leftHigh and "HIT" or "MISS",
+		"rightLow:", rightLow and "HIT" or "MISS",
+		"rightHigh:", rightHigh and "HIT" or "MISS")
+
+	local bestL = _chooseBestHit(leftLow,  leftHigh,  origin)
+	local bestR = _chooseBestHit(rightLow, rightHigh, origin)
+
+	-- Ignore our debug visuals
+	if bestL and bestL.Hit.Name == "RaycastVisual" then bestL = nil end
+	if bestR and bestR.Hit.Name == "RaycastVisual" then bestR = nil end
+
+	-- Corner guard before starting: if both sides hit and look like different walls, refuse
+	if Config.CornerGuard and Config.CornerGuard.Enabled and bestL and bestR
+		and bestL.Hit and bestR.Hit and bestL.Hit.CanCollide and bestR.Hit.CanCollide then
+
+		local nL, nR = bestL.Normal, bestR.Normal
+		local diffDeg = _angleBetweenNormals(nL, nR)
+		local dL = (bestL.Position - origin).Magnitude
+		local dR = (bestR.Position - origin).Magnitude
+		local nearSameDist = math.abs(dL - dR) <= (Config.CornerGuard.DistanceEpsilon or 0.6)
+
+		if diffDeg >= (Config.CornerGuard.NormalDiffDeg or 25) and nearSameDist then
+			print(string.format("[WR] Corner guard: both sides hit (%.1f° apart, dΔ=%.2f) → refuse this frame",
+				diffDeg, math.abs(dL - dR)))
+			return false
+		end
+	end
+
+	-- Side sector wedge
+	local minDeg  = (Config.RunSectorMinDeg  or 28) - (Config.SectorSlackDeg or 8)
+	local maxDeg  = (Config.RunSectorMaxDeg  or 135) + (Config.SectorSlackDeg or 8)
+
+	local cand = {}
+
+	if bestL and bestL.Hit and bestL.Hit.CanCollide then
+		local a = _absAngleFromForward(rootPart.CFrame, bestL.Position)
+		if a >= minDeg and a <= maxDeg then
+			table.insert(cand, {dir=-1, hit=bestL, angle=a})
+		end
+	end
+	if bestR and bestR.Hit and bestR.Hit.CanCollide then
+		local a = _absAngleFromForward(rootPart.CFrame, bestR.Position)
+		if a >= minDeg and a <= maxDeg then
+			table.insert(cand, {dir=1, hit=bestR, angle=a})
+		end
+	end
+
+	if #cand == 0 then
+		print("[DEBUG] Wall Run Sector - No candidates in sector wedge")
+		return false
+	end
+
+	-- Choose the better side: closer or more purely sideways (≈90°)
+	if #cand == 2 then
+		local dA = (cand[1].hit.Position - origin).Magnitude
+		local dB = (cand[2].hit.Position - origin).Magnitude
+		if math.abs(dA - dB) > (Config.CornerGuard and Config.CornerGuard.DistanceEpsilon or 0.6) then
+			if dA > dB then cand[1], cand[2] = cand[2], cand[1] end
+		else
+			table.sort(cand, function(a,b) return math.abs(a.angle - 90) < math.abs(b.angle - 90) end)
+		end
+	end
+
+	table.sort(cand, function(a, b)
+		return math.abs(a.angle - 90) < math.abs(b.angle - 90)
+	end)
+
+	local pick = cand[1]
+	local normal = pick.hit.Normal
+
+	-- Final facing sanity: make sure we’re aligned sideways enough
+	local up = Vector3.new(0, 1, 0)
+	local tangent = normal:Cross(up)
+	if tangent.Magnitude < 1e-3 then
+		print("[DEBUG] Wall Run Sector - Tangent calculation failed")
+		return false
+	end
+	local sideDot = rootPart.CFrame.RightVector:Dot(tangent.Unit)
+
+	print("[DEBUG] Wall Run Sector - Chosen dir:", pick.dir, "angle:", pick.angle,
+		"sideDot:", sideDot, "threshold:", Config.RunFacingDotThreshold)
+
+	if math.abs(sideDot) < (Config.RunFacingDotThreshold or 0.25) then
+		print("[DEBUG] Wall Run Sector - Failed sideDot threshold")
+		return false
+	end
+
+	return true, pick.dir, normal, pick.angle
+end
+
+
+function ParkourController:GetDashDirectionVector(direction)
+	if direction == "Front" then
+		return rootPart.CFrame.LookVector
+	elseif direction == "Back" then
+		return -rootPart.CFrame.LookVector
+	elseif direction == "Left" then
+		return -rootPart.CFrame.RightVector
+	elseif direction == "Right" then
+		return rootPart.CFrame.RightVector
+	end
+	return rootPart.CFrame.LookVector
+end
+
+-- AIR JUMP SYSTEM
+function ParkourController:AttemptAirJump()
+	if not StateManager:CanPerformAction(character, "AirJump") then return end
+	if airJumpUses <= 0 then return end
+	if not CooldownManager:IsReady("AirJump") then return end
+	-- prevent air jump from stealing input if a wall-run is immediately available/ready
+	if not CooldownManager:IsReady("WallRun") then
+		local walls = RaycastUtil:CheckWallsAround(character, Config.WallRunDetectionRange)
+		if walls.Left or walls.Right then return end
+	end
+	self:ExecuteAirJump()
+end
+
+function ParkourController:ExecuteAirJump()
+	airJumpUses -= 1
+	StateManager:AddState(character, "AirJumping", Config.AirJumpLength)
+	CooldownManager:Apply("AirJump", Config.AirJumpCooldown)
+	AnimationManager:StopAllAnimations(character, 0)
+	AnimationManager:PlayAnimation(character, "AirJump", nil, 1.5, 0)
+	self:PlaySound(Config.Sounds.AirJump, rootPart, 1.5)
+	VelocityHandler:CreateAirJumpVelocity(rootPart, Config.AirJumpPower, Config.AirJumpLength)
+	humanoid.JumpHeight = 0
+	task.delay(Config.AirJumpLength - 0.35, function()
+		if StateManager:HasState(character, "Sprinting") then
+			humanoid.WalkSpeed = Config.RunningSpeed
+			humanoid.JumpHeight = Config.RunningJumpHeight
+		else
+			humanoid.WalkSpeed = Config.BaseSpeed
+			humanoid.JumpHeight = Config.BaseJumpHeight
+		end
+	end)
+end
+
+-- WALL RUN SYSTEM (sector-gated)
+function ParkourController:AttemptWallRun()
+	-- never re-start while already wall-running
+	if StateManager:HasState(character, "WallRunning") then return false end
+	if not StateManager:CanPerformAction(character, "WallRun") then return false end
+	if wallRunUses <= 0 then return false end
+	if not CooldownManager:IsReady("WallRun") then return false end
+
+	-- allow: Freefall OR Jumping OR short coyote after leaving ground
+	local state = humanoid:GetState()
+	local isAir = (state == Enum.HumanoidStateType.Freefall) or (state == Enum.HumanoidStateType.Jumping)
+	local withinCoyote = (lastFreefallStart > 0) and (tick() - lastFreefallStart <= Config.WallRunCoyote)
+
+	-- Debug logging for AttemptWallRun
+	local coyoteDelta = lastFreefallStart > 0 and (tick() - lastFreefallStart) or -1
+	print("[DEBUG] AttemptWallRun - State:", state, "isAir:", isAir, "withinCoyote:", withinCoyote,
+		"coyoteDelta:", coyoteDelta, "wallRunUses:", wallRunUses, "cooldownReady:", CooldownManager:IsReady("WallRun"))
+
+	if not (isAir or withinCoyote) then
+		print("[DEBUG] AttemptWallRun - Failed state/coyote check")
+		return false
+	end
+
+	-- avoid if plummeting straight down
+	local v = rootPart.AssemblyLinearVelocity
+	if -v.Y > 250 then
+		print("[DEBUG] AttemptWallRun - Falling too fast:", -v.Y)
+		return false
+	end
+
+	-- Sector‑gated side detection
+	local ok, wallDir, wallNormal = self:ShouldStartWallRunBySector()
+	if not ok then
+		print("[DEBUG] AttemptWallRun - No valid wall sector found")
+		return false
+	end
+
+	print("[DEBUG] AttemptWallRun - Starting wall run!")
+	self:ExecuteWallRun(wallDir, wallNormal)
+	return true
+end
+
+function ParkourController:ExecuteWallRun(wallDirection, wallNormal)
+	-- Prevent leftovers from a previous run
+	if currentWallRunStop then
+		currentWallRunStop("restart")
+		currentWallRunStop = nil
+	end
+
+	-- If something slipped through previously, nuke old monitor
+	if connections.wallRunMonitor then
+		connections.wallRunMonitor:Disconnect()
+		connections.wallRunMonitor = nil
+	end
+
+	-- Tiny debounce so spam can't queue a second start immediately
+	CooldownManager:Apply("WallRun", 0.2)
+
+	wallRunUses -= 1
+	currentWallRunDirection = wallDirection
+
+	StateManager:AddState(character, "WallRunning")
+	CooldownManager:Apply("WallRunLeap", 0.001)
+
+	humanoid.WalkSpeed = 0
+	humanoid.JumpHeight = 0
+	humanoid.AutoRotate = false
+
+	AnimationManager:StopAllAnimations(character, 0)
+	local animDirection = wallDirection == 1 and "Right" or "Left"
+	AnimationManager:PlayAnimation(character, "WallRun", animDirection, 1, 0)
+	self:PlaySound(Config.Sounds.WallRun, rootPart, Config.WallRunDuration)
+
+	local wallDirectionVector = wallNormal:Cross(Vector3.new(0, wallDirection, 0))
+	local velocity = VelocityHandler:CreateWallRunVelocity(rootPart, wallDirectionVector, Config.WallRunSpeed)
+
+	-- Ensure RootAttachment exists before creating AlignOrientation
+	local attachment = rootPart:FindFirstChild("RootAttachment")
+	if not attachment then
+		attachment = Instance.new("Attachment")
+		attachment.Name = "RootAttachment"
+		attachment.Parent = rootPart
+	end
+
+	local alignOrientation = Instance.new("AlignOrientation")
+	alignOrientation.Parent = rootPart
+	alignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	alignOrientation.Attachment0 = attachment
+	alignOrientation.Responsiveness = 100
+
+	-- Look along tangent
+	local lookDirection = (wallDirection == 1)
+		and wallNormal:Cross(Vector3.new(0, 1, 0))
+		or  wallNormal:Cross(Vector3.new(0,-1, 0))
+	alignOrientation.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + lookDirection, Vector3.new(0, 1, 0))
+
+	-- Seed previous yaw for monitoring
+	do
+		local v = workspace.CurrentCamera.CFrame.LookVector
+		local yaw = math.deg(math.atan2(v.X, v.Z))
+		if yaw < 0 then yaw += 360 end
+		self._prevYawDeg = yaw
+	end
+
+	self:StartWallRunMonitoring(velocity, alignOrientation, wallDirection, wallNormal)
+end
+
+function ParkourController:StartWallRunMonitoring(velocity, alignOrientation, wallDirection, wallNormal)
+	-- refs
+	local hum = humanoid
+	local root = rootPart
+	if not (hum and root) then return end
+
+	-- welded hitbox for ALL rays
+	local hb = hitbox
+	if not hb or not hb.Parent then
+		self:StopWallRun(velocity, alignOrientation)
+		return
+	end
+
+	-- Tunables
+	local SIDE_RAY_LENGTH   = 5.0
+	local SIDE_MISS_GRACE   = Config.WallRunSideMissGrace or 0.20
+	local EDGE_MISS_GRACE   = Config.WallRunEdgeMissGrace or 0.12
+	local CAM_BREAK_HARD    = 95
+	local CAM_BREAK_SOFT    = 60
+	local LOOKAWAY_SOFT     = Config.WallRunLookAwaySoftDeg or 75
+	local LOOKAWAY_HARD     = Config.WallRunLookAwayHardDeg or 110
+	local NORMAL_SIM_THRESH = 40
+	local HEIGHTS           = {0.0, 1.5}
+	local FRONT_OBS_RANGE   = 1.75   -- short probe along tangent to catch “wall in front”
+	local CORNER_DIFF_DEG   = (Config.CornerGuard and Config.CornerGuard.NormalDiffDeg) or 25
+
+	-- State
+	local running       = true
+	local sideMissClock = 0
+	local edgeMissClock = 0
+	self._prevYawDeg    = self._prevYawDeg or 0
+	self._wallRunDrop   = 0
+
+	-- Helpers
+	local function camYawDeg()
+		local cam = workspace.CurrentCamera
+		if not cam then return 0 end
+		local v = cam.CFrame.LookVector
+		local yaw = math.deg(math.atan2(v.X, v.Z))
+		if yaw < 0 then yaw += 360 end
+		return yaw
+	end
+	local function yawDelta(a, b)
+		local d = math.abs(a - b) % 360
+		if d > 180 then d = 360 - d end
+		return d
+	end
+	local function similarNormal(a: Vector3, b: Vector3)
+		local d = math.clamp(a:Dot(b), -1, 1)
+		return math.deg(math.acos(d)) <= NORMAL_SIM_THRESH
+	end
+	local function yawFromVectorXZ(v: Vector3)
+		local xz = Vector3.new(v.X, 0, v.Z)
+		if xz.Magnitude < 1e-5 then return 0 end
+		local yaw = math.deg(math.atan2(xz.X, xz.Z))
+		if yaw < 0 then yaw += 360 end
+		return yaw
+	end
+	local function wallTangentForSide(n: Vector3, dir: number)
+		return (dir == 1) and n:Cross(Vector3.new(0, 1, 0)) or n:Cross(Vector3.new(0,-1, 0))
+	end
+
+	-- kill any previous loop just in case
+	if connections.wallRunMonitor then
+		connections.wallRunMonitor:Disconnect()
+		connections.wallRunMonitor = nil
+	end
+
+	connections.wallRunMonitor = RunService.RenderStepped:Connect(function(dt)
+		if not running then return end
+		if not (character and character.Parent and root.Parent and hum.Parent and hb.Parent) then
+			print("[WR] monitor: character/hitbox gone")
+			self:StopWallRun(velocity, alignOrientation)
+			running = false
+			return
+		end
+
+		-- End if grounded
+		if hum.FloorMaterial ~= Enum.Material.Air then
+			print("[WR] monitor: grounded → stop")
+			self:StopWallRun(velocity, alignOrientation)
+			running = false
+			return
+		end
+
+		-- --- CAMERA BREAKERS -------------------------------------------------
+		local nowYaw = camYawDeg()
+		local dYaw   = yawDelta(self._prevYawDeg, nowYaw)
+		self._prevYawDeg = nowYaw
+		if dYaw >= CAM_BREAK_HARD then
+			print("[WR] monitor: camera snap (", math.floor(dYaw), "deg ) → stop")
+			self:StopWallRun(velocity, alignOrientation)
+			running = false
+			return
+		end
+
+		-- Look-away breaker (camera vs current tangent)
+		local lookDirTangent = wallTangentForSide(wallNormal, wallDirection).Unit
+		local camYaw  = nowYaw
+		local tangYaw = yawFromVectorXZ(lookDirTangent)
+		local lookAwayDeg = yawDelta(camYaw, tangYaw)
+		if lookAwayDeg >= LOOKAWAY_HARD then
+			print("[WR] monitor: look-away (", math.floor(lookAwayDeg), "deg ) → stop")
+			self:StopWallRun(velocity, alignOrientation)
+			running = false
+			return
+		end
+
+		-- --- RAYS: ONLY the side-face you are running on ---------------------
+		local sideFace = (wallDirection == -1) and "Left" or "Right"
+		local sideHasContact = false
+		local bestSideNormal = nil
+		local sideDistances = {}
+
+		for _, h in ipairs(HEIGHTS) do
+			local hit = RaycastUtil:Cast(hb, sideFace, SIDE_RAY_LENGTH, {
+				blacklist = {character},
+				verticalOffset = h,
+				visualize = Config.VisualizeRaycasts,
+			})
+
+			if hit and hit.Hit and hit.Hit.CanCollide then
+				table.insert(sideDistances, hit.Distance or SIDE_RAY_LENGTH)
+				if not bestSideNormal then bestSideNormal = hit.Normal end
+				if similarNormal(hit.Normal, wallNormal) then
+					sideHasContact = true
+					bestSideNormal = hit.Normal
+					break -- one good match is enough
+				end
+			end
+		end
+
+		-- Grace when side contact is missing
+		if not sideHasContact then
+			sideMissClock += dt
+		else
+			sideMissClock = 0
+		end
+
+		-- If soft snap or soft look-away, compress grace this frame
+		local sideGrace = SIDE_MISS_GRACE
+		if dYaw >= CAM_BREAK_SOFT or lookAwayDeg >= LOOKAWAY_SOFT then
+			sideGrace *= 0.5
+		end
+
+		-- --- FRONT OBSTACLE / CORNER BREAKERS --------------------------------
+		-- Short probe along the **tangent** we’re running to catch a wall in front
+		do
+			local tangentDir = lookDirTangent
+			local frontHit = workspace:Raycast(hb.Position, tangentDir * FRONT_OBS_RANGE, (function()
+				local p = RaycastParams.new()
+				p.FilterType = Enum.RaycastFilterType.Exclude
+				p.FilterDescendantsInstances = {character}
+				p.IgnoreWater = true
+				return p
+			end)())
+
+			-- 1) Hard break if we meet a wall directly in front (not the same wall)
+			if frontHit and frontHit.Instance and frontHit.Instance.CanCollide then
+				local n = frontHit.Normal
+				local ang = math.deg(math.acos(math.clamp(n:Dot(wallNormal), -1, 1)))
+				-- If the ahead wall is anything but nearly the same plane, treat as obstacle.
+				if ang >= CORNER_DIFF_DEG then
+					print("[WR] monitor: obstacle ahead → stop")
+					self:StopWallRun(velocity, alignOrientation)
+					running = false
+					return
+				end
+			end
+
+			-- 2) Corner while running: if both side heights are hitting but normals diverge a lot, stop
+			-- (We reuse bestSideNormal; if it drifts far from original wallNormal, it’s effectively a corner.)
+			if bestSideNormal then
+				local diffDeg = math.deg(math.acos(math.clamp(bestSideNormal:Dot(wallNormal), -1, 1)))
+				if diffDeg >= CORNER_DIFF_DEG then
+					print(string.format("[WR] monitor: corner detected (Δ≈%.1f°) → stop", diffDeg))
+					self:StopWallRun(velocity, alignOrientation)
+					running = false
+					return
+				end
+			end
+		end
+
+		-- Apply side-loss threshold
+		if sideMissClock >= sideGrace then
+			print("[WR] monitor: side loss ", string.format("%.2f", sideMissClock), "s → stop")
+			self:StopWallRun(velocity, alignOrientation)
+			running = false
+			return
+		end
+
+		-- Keep AlignOrientation pointing along the wall tangent (with mild normal drift)
+		if bestSideNormal then
+			wallNormal = (wallNormal:Lerp(bestSideNormal, 0.10)).Unit
+			local lookDir = wallTangentForSide(wallNormal, wallDirection)
+			alignOrientation.CFrame = CFrame.lookAt(root.Position, root.Position + lookDir, Vector3.new(0,1,0))
+		end
+
+		-- Slow downward bleed
+		self._wallRunDrop += (Config.WallRunDecrease / 180)
+		local vel = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(vel.X, math.max(vel.Y, -self._wallRunDrop), vel.Z)
+	end)
+end
+
+
+function ParkourController:AttemptWallRunLeap()
+	if not StateManager:HasState(character, "WallRunning") then return end
+	if not CooldownManager:IsReady("WallRunLeap") then return end
+	self:ExecuteWallRunLeap()
+end
+
+function ParkourController:ExecuteWallRunLeap()
+	StateManager:RemoveState(character, "WallRunning")
+
+	if connections.wallRunMonitor then
+		connections.wallRunMonitor:Disconnect()
+		connections.wallRunMonitor = nil
+	end
+
+	VelocityHandler:ClearMovers(rootPart)
+	for _, child in pairs(rootPart:GetChildren()) do
+		if child:IsA("AlignOrientation") then
+			child:Destroy()
+		end
+	end
+
+	humanoid.AutoRotate = true
+	airJumpUses = Config.AirJumpUses
+
+	AnimationManager:StopAllAnimations(character, 0)
+	local animDirection = currentWallRunDirection == 1 and "LeapLeft" or "LeapRight"
+	AnimationManager:PlayAnimation(character, "WallRun", animDirection, 1, 0)
+	self:PlaySound(Config.Sounds.WallRunLeap, rootPart, 1.75)
+
+	local horizontal = currentWallRunDirection == 1 and -rootPart.CFrame.RightVector or rootPart.CFrame.RightVector
+	horizontal *= Config.WallRunLeapHorizontalPower
+
+	local vertical = Vector3.new(0, Config.WallRunLeapVerticalPower, 0)
+	local forward  = rootPart.CFrame.LookVector * Config.WallRunLeapForwardPower
+	local totalVelocity = horizontal + vertical + forward
+
+	local leapVelocity = VelocityHandler:CreateLinearVelocity(rootPart, {
+		constrainAxes = {X = true, Y = true, Z = true}
+	})
+	leapVelocity.VectorVelocity = totalVelocity
+	game:GetService("Debris"):AddItem(leapVelocity, 0.175)
+
+	CooldownManager:Reset("WallRun")
+end
+
+function ParkourController:StopWallRun(velocity, alignOrientation)
+	StateManager:RemoveState(character, "WallRunning")
+
+	-- Always disconnect and clear the monitor
+	if connections.wallRunMonitor then
+		connections.wallRunMonitor:Disconnect()
+		connections.wallRunMonitor = nil
+	end
+
+	-- Destroy handles passed in
+	if velocity then velocity:Destroy() end
+	if alignOrientation then alignOrientation:Destroy() end
+
+	-- Extra safety: clear any leftover movers/orienters that might have stacked
+	VelocityHandler:ClearMovers(rootPart)
+	for _, child in ipairs(rootPart:GetChildren()) do
+		if child:IsA("AlignOrientation") then
+			child:Destroy()
+		end
+	end
+
+	local animDirection = currentWallRunDirection == 1 and "Right" or "Left"
+	AnimationManager:StopAnimation(character, "WallRun", animDirection, 0)
+
+	-- Restore movement consistently
+	if StateManager:HasState(character, "Sprinting") then
+		humanoid.WalkSpeed = Config.RunningSpeed
+		humanoid.JumpHeight = Config.RunningJumpHeight
+	else
+		humanoid.WalkSpeed = Config.BaseSpeed
+		humanoid.JumpHeight = Config.BaseJumpHeight
+	end
+	humanoid.AutoRotate = true
+
+	-- Cooldown ready again for next try
+	CooldownManager:Reset("WallRun")
+end
+
+-- CAMERA SYSTEM
+function ParkourController:StartUpdateLoop()
+	connections.updateLoop = RunService.RenderStepped:Connect(function()
+		self:UpdateCameraOffset()
+	end)
+end
+
+function ParkourController:UpdateCameraOffset()
+	if not character:FindFirstChild("Head") then return end
+	TweenService:Create(humanoid, TweenInfo.new(0.3), {
+		CameraOffset = (rootPart.CFrame + Vector3.new(0, 1.5, 0)):pointToObjectSpace(character.Head.CFrame.Position)
+	}):Play()
+end
+
+-- UTILITY FUNCTIONS
+function ParkourController:PlaySound(soundId, parent, duration)
+	if soundId == "rbxassetid://0" then return end
+	local sound = self:CreateSound(soundId, parent)
+	sound:Play()
+	if duration then game:GetService("Debris"):AddItem(sound, duration) end
+	return sound
+end
+
+function ParkourController:CreateSound(soundId, parent)
+	-- Treat missing/placeholder assets as "no sound"
+	if not soundId or soundId == "rbxassetid://0" then
+		local s = Instance.new("Sound")
+		s.SoundId = ""        -- empty so Roblox won't try to load anything
+		s.Volume = 0          -- silent by default
+		s.Parent = parent or SoundService
+		return s
+	end
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = soundId
+	sound.Volume = 0.5
+	sound.Parent = parent or SoundService
+	return sound
+end
+
+-- === RESTORE / FAILSAFE UTILITIES ===========================================
+function ParkourController:RestoreMovementDefaults()
+	-- Clear any movers/orienters that could pin movement or rotation
+	VelocityHandler:ClearMovers(rootPart)
+	for _, child in ipairs(rootPart:GetChildren()) do
+		if child:IsA("AlignOrientation") then
+			child:Destroy()
+		end
+	end
+
+	-- Always put the humanoid back into a sane state
+	humanoid.AutoRotate = true
+	if StateManager:HasState(character, "Sprinting") then
+		humanoid.WalkSpeed = Config.RunningSpeed
+		humanoid.JumpHeight = Config.RunningJumpHeight
+	else
+		humanoid.WalkSpeed = Config.BaseSpeed
+		humanoid.JumpHeight = Config.BaseJumpHeight
+	end
+
+	-- Extra safety: clear short-lived movement states that could block inputs
+	StateManager:RemoveState(character, "Dashing")
+	StateManager:RemoveState(character, "WallRunning")
+end
+
+-- CHARACTER HANDLING
+function ParkourController:OnCharacterAdded(newCharacter)
+	self:Cleanup()
+	character = newCharacter
+	humanoid = character:WaitForChild("Humanoid")
+	rootPart = character:WaitForChild("HumanoidRootPart")
+	hitbox = nil  -- will be recreated in Init()
+	airJumpUses = Config.AirJumpUses
+	wallRunUses = Config.WallRunUses
+	currentWallRunDirection = 0
+	lastFreefallStart = -1
+	self:Init()
+end
+
+function ParkourController:Cleanup()
+	for _, connection in pairs(connections) do
+		if connection then connection:Disconnect() end
+	end
+	connections = {}
+
+	-- Detach hitbox
+	if character then
+		HitboxManager:Detach(character)
+	end
+
+	-- Disable visualization
+	HitboxVisualizer:Toggle(player, false)
+
+	CooldownManager:ResetAll()
+end
+
+-- Initialize
+ParkourController:Init()
+
+player.CharacterAdded:Connect(function(newCharacter)
+	ParkourController:OnCharacterAdded(newCharacter)
+end)
+
+return ParkourController
