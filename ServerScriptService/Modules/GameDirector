@@ -1,0 +1,62 @@
+-- ServerScriptService/Modules/GameDirector.lua
+-- Lightweight state owner that delegates phases to MatchLoop.
+-- No direct teleportation here (movement handled by MapService via respawn).
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("GameConfig"))
+
+local GameDirector = {}
+
+-- ================== STATE ==================
+GameDirector.States = {
+	Lobby = "Lobby",
+	Match = "Match",
+	PostGame = "PostGame",
+}
+
+local currentState: string = GameDirector.States.Lobby
+
+-- ================== DEBUG ==================
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "Director") then
+		print("[Director] " .. message)
+	end
+end
+
+-- ================== API ==================
+function GameDirector.GetState(): string
+	return currentState
+end
+
+function GameDirector._ChangeState(newState: string)
+	currentState = newState
+	debugLog(("State change: %s"):format(newState))
+
+	-- Let MatchLoop (or others) hook this if needed
+	local ok, MatchLoop = pcall(function()
+		return require(script.Parent.MatchLoop)
+	end)
+	if ok and MatchLoop and typeof(MatchLoop._NotifyStateChange) == "function" then
+		MatchLoop._NotifyStateChange(newState)
+	end
+end
+
+-- Entry point called by GameStartup
+function GameDirector.Start()
+	debugLog("Game Director starting...")
+
+	-- Ensure Teams exist before anything else
+	local TeamsService = require(ServerScriptService.Modules.TeamsService)
+	TeamsService.InitializeTeams()
+
+	-- Enter Lobby and let MatchLoop handle the rest (respawn-only flow)
+	GameDirector._ChangeState(GameDirector.States.Lobby)
+
+	local MatchLoop = require(script.Parent.MatchLoop)
+	MatchLoop.BeginLobby()  -- No MapService.*Teleport* calls here
+end
+
+return GameDirector
