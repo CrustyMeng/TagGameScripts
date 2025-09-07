@@ -1,0 +1,310 @@
+--[[
+SCRIPT_PATHS
+  Self: ReplicatedStorage/Modules/Shared/Movement/RaycastUtil
+  Requires:
+    - (none - utility only)
+  Remotes:
+    - (none)
+  UsesConfigKeys:
+    - (none - takes parameters)
+]]
+
+-- ReplicatedStorage/Shared/Movement/RaycastUtil.lua
+-- Handles all raycasting operations for shared use
+
+local RaycastUtil = {}
+local Debris = game:GetService("Debris")
+
+function RaycastUtil:Cast(originPart, direction, range, options)
+	options = options or {}
+
+	-- Normalized filter to use character only
+	local blacklist = options.blacklist or {workspace.Characters}
+	local horizontalOffset = options.horizontalOffset or 0
+	local verticalOffset = options.verticalOffset or 0
+	local visualize = options.visualize or false
+
+	-- Setup raycast parameters (normalized to use Exclude)
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = blacklist
+
+	-- Calculate origin with offset
+	local offsetCFrame = CFrame.new(horizontalOffset, verticalOffset, 0)
+	local origin = (originPart.CFrame * offsetCFrame).Position
+
+	-- Calculate direction vector
+	local directionVector = self:GetDirectionVector(originPart, direction, range)
+
+	-- Perform raycast
+	local result = workspace:Raycast(origin, directionVector, raycastParams)
+
+	-- Visualize if requested
+	if visualize then
+		self:VisualizeRay(origin, directionVector)
+	end
+
+	if result then
+		return {
+			Hit = result.Instance,
+			Position = result.Position,
+			Normal = result.Normal,
+			Distance = result.Distance
+		}
+	end
+
+	return nil
+end
+
+-- NEW: Cast from specific face of a box part
+function RaycastUtil:CastFromFace(boxPart, face, range, options)
+	options = options or {}
+
+	-- Normalized filter
+	local blacklist = options.blacklist or {workspace.Characters}
+	local visualize = options.visualize or false
+
+	-- Setup raycast parameters
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = blacklist
+
+	-- Calculate face center and direction
+	local cf = boxPart.CFrame
+	local size = boxPart.Size
+	local origin, direction
+
+	if face == "Front" then
+		origin = cf * CFrame.new(0, 0, -size.Z/2)
+		direction = -cf.LookVector * range
+	elseif face == "Back" then
+		origin = cf * CFrame.new(0, 0, size.Z/2)
+		direction = cf.LookVector * range
+	elseif face == "Left" then
+		origin = cf * CFrame.new(-size.X/2, 0, 0)
+		direction = -cf.RightVector * range
+	elseif face == "Right" then
+		origin = cf * CFrame.new(size.X/2, 0, 0)
+		direction = cf.RightVector * range
+	elseif face == "Top" then
+		origin = cf * CFrame.new(0, size.Y/2, 0)
+		direction = cf.UpVector * range
+	elseif face == "Bottom" then
+		origin = cf * CFrame.new(0, -size.Y/2, 0)
+		direction = -cf.UpVector * range
+	else
+		warn("Unknown face: " .. tostring(face))
+		return nil
+	end
+
+	origin = origin.Position
+
+	-- Perform raycast
+	local result = workspace:Raycast(origin, direction, raycastParams)
+
+	-- Visualize if requested
+	if visualize then
+		self:VisualizeRay(origin, direction)
+	end
+
+	if result then
+		return {
+			Hit = result.Instance,
+			Position = result.Position,
+			Normal = result.Normal,
+			Distance = result.Distance
+		}
+	end
+
+	return nil
+end
+
+-- NEW: Cast 8 rays in star pattern on XZ plane
+function RaycastUtil:CastStar(boxPart, range, options)
+	options = options or {}
+
+	local results = {}
+	local directions = {
+		"Forward", "Back", "Left", "Right"
+	}
+
+	-- Add diagonals if enabled
+	local config = require(game.ReplicatedStorage.Modules.MovementSystemV7.Config)
+	if config.Hitbox.UseDiagonals then
+		table.insert(directions, "ForwardLeft")
+		table.insert(directions, "ForwardRight") 
+		table.insert(directions, "BackLeft")
+		table.insert(directions, "BackRight")
+	end
+
+	-- Normalized filter
+	local blacklist = options.blacklist or {workspace.Characters}
+	local visualize = options.visualize or false
+
+	-- Setup raycast parameters
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = blacklist
+
+	local cf = boxPart.CFrame
+	local origin = cf.Position
+
+	for _, dir in ipairs(directions) do
+		local direction
+
+		if dir == "Forward" then
+			direction = cf.LookVector * range
+		elseif dir == "Back" then
+			direction = -cf.LookVector * range
+		elseif dir == "Left" then
+			direction = -cf.RightVector * range
+		elseif dir == "Right" then
+			direction = cf.RightVector * range
+		elseif dir == "ForwardLeft" then
+			direction = (cf.LookVector - cf.RightVector).Unit * range
+		elseif dir == "ForwardRight" then
+			direction = (cf.LookVector + cf.RightVector).Unit * range
+		elseif dir == "BackLeft" then
+			direction = (-cf.LookVector - cf.RightVector).Unit * range
+		elseif dir == "BackRight" then
+			direction = (-cf.LookVector + cf.RightVector).Unit * range
+		end
+
+		if direction then
+			local result = workspace:Raycast(origin, direction, raycastParams)
+
+			if visualize then
+				self:VisualizeRay(origin, direction)
+			end
+
+			if result then
+				results[dir] = {
+					Hit = result.Instance,
+					Position = result.Position,
+					Normal = result.Normal,
+					Distance = result.Distance
+				}
+			end
+		end
+	end
+
+	return results
+end
+
+-- NEW: Get parts overlapping with hitbox
+function RaycastUtil:GetPartsInHitbox(boxPart, overlapParams)
+	if not overlapParams then
+		overlapParams = OverlapParams.new()
+		overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+		overlapParams.FilterDescendantsInstances = {workspace.Characters}
+	end
+
+	local parts = workspace:GetPartsInPart(boxPart, overlapParams)
+
+	-- Simple filtering
+	local players = {}
+	local otherParts = {}
+
+	for _, part in ipairs(parts) do
+		local character = part.Parent
+		if character and character:FindFirstChild("Humanoid") then
+			local player = game.Players:GetPlayerFromCharacter(character)
+			if player then
+				table.insert(players, player)
+			end
+		else
+			table.insert(otherParts, part)
+		end
+	end
+
+	return {
+		players = players,
+		parts = otherParts
+	}
+end
+
+function RaycastUtil:GetDirectionVector(part, direction, range)
+	local directions = {
+		Forward = part.CFrame.LookVector,
+		Backward = -part.CFrame.LookVector,
+		Left = -part.CFrame.RightVector,
+		Right = part.CFrame.RightVector,
+		Up = part.CFrame.UpVector,
+		Down = -part.CFrame.UpVector
+	}
+
+	local vector = directions[direction] or directions.Forward
+	return vector * range
+end
+
+function RaycastUtil:VisualizeRay(origin, direction)
+	local visualPart = Instance.new("Part")
+	visualPart.Anchored = true
+	visualPart.CanCollide = false
+	visualPart.Size = Vector3.new(0.1, 0.1, direction.Magnitude)
+	visualPart.CFrame = CFrame.lookAt(origin, origin + direction) * CFrame.new(0, 0, -direction.Magnitude / 2)
+	visualPart.BrickColor = BrickColor.new("Bright red")
+	visualPart.Material = Enum.Material.Neon
+	visualPart.Parent = workspace
+	visualPart.Name = "RaycastVisual"
+
+	Debris:AddItem(visualPart, 0.1)
+end
+
+-- Multi-directional wall detection
+function RaycastUtil:CheckWallsAround(character, range)
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then return {} end
+
+	local results = {}
+	local directions = {"Forward", "Left", "Right"}
+
+	for _, direction in pairs(directions) do
+		local result = self:Cast(rootPart, direction, range, {
+			blacklist = {character},
+			visualize = false
+		})
+
+		if result then
+			results[direction] = result
+		end
+	end
+
+	return results
+end
+
+-- Floor detection with multiple points
+function RaycastUtil:CheckFloor(character, range)
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then return nil end
+
+	-- Check center
+	local centerResult = self:Cast(rootPart, "Down", range or 10, {
+		blacklist = {character}
+	})
+
+	if centerResult then
+		return centerResult
+	end
+
+	-- Check around character if center fails
+	local offsets = {
+		{1, 0}, {-1, 0}, {0, 1}, {0, -1}
+	}
+
+	for _, offset in pairs(offsets) do
+		local result = self:Cast(rootPart, "Down", range or 10, {
+			blacklist = {character},
+			horizontalOffset = offset[1],
+			verticalOffset = offset[2]
+		})
+
+		if result then
+			return result
+		end
+	end
+
+	return nil
+end
+
+return RaycastUtil
