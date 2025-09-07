@@ -1,0 +1,148 @@
+-- UPDATED: VelocityHandler.txt — removed CreateWallClingVelocity and CreateVaultVelocity
+
+-- Handles LinearVelocity creation and management
+-- Game.ReplicatedStorage.Modules.MovementSystemV7.VelocityHandler (this is a module script)
+
+local VelocityHandler = {}
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+function VelocityHandler:ClearMovers(rootPart)
+	-- Nuke any lingering movers before attaching new ones
+	for _, child in pairs(rootPart:GetChildren()) do
+		if child.Name == "ParkourMover" and child:IsA("LinearVelocity") then
+			child:Destroy()
+		end
+	end
+end
+
+function VelocityHandler:CreateLinearVelocity(rootPart, config)
+	-- Clear existing movers first
+	self:ClearMovers(rootPart)
+
+	local attachment = rootPart:FindFirstChild("RootAttachment")
+	if not attachment then
+		attachment = Instance.new("Attachment")
+		attachment.Name = "RootAttachment" 
+		attachment.Parent = rootPart
+	end
+
+	local linearVelocity = Instance.new("LinearVelocity")
+	linearVelocity.Name = "ParkourMover"
+	linearVelocity.Attachment0 = attachment
+	linearVelocity.MaxForce = config.maxForce or math.huge
+	linearVelocity.RelativeTo = config.relativeTo or Enum.ActuatorRelativeTo.World
+
+	-- Fixed boolean default handling for ForceLimitsEnabled
+	if config.forceLimitsEnabled == nil then
+		linearVelocity.ForceLimitsEnabled = true
+	else
+		linearVelocity.ForceLimitsEnabled = config.forceLimitsEnabled
+	end
+
+	linearVelocity.ForceLimitMode = config.forceLimitMode or Enum.ForceLimitMode.PerAxis
+
+	-- Set force limits based on mass
+	local mass = rootPart.AssemblyMass
+	local forceMultiplier = config.forceMultiplier or 1000
+
+	if config.constrainAxes then
+		local x = config.constrainAxes.X and mass * forceMultiplier or 0
+		local y = config.constrainAxes.Y and mass * forceMultiplier or 0  
+		local z = config.constrainAxes.Z and mass * forceMultiplier or 0
+		linearVelocity.MaxAxesForce = Vector3.new(x, y, z)
+	else
+		linearVelocity.MaxAxesForce = Vector3.new(mass * forceMultiplier, mass * forceMultiplier, mass * forceMultiplier)
+	end
+
+	linearVelocity.Parent = rootPart
+
+	return linearVelocity
+end
+
+function VelocityHandler:CreateDashVelocity(rootPart, direction, speed, duration)
+	local config = {
+		constrainAxes = {X = true, Y = false, Z = true},
+		forceMultiplier = 1000
+	}
+
+	local velocity = self:CreateLinearVelocity(rootPart, config)
+	local speedValue = Instance.new("NumberValue")
+	speedValue.Value = speed
+
+	local connection
+	connection = game:GetService("RunService").RenderStepped:Connect(function()
+		if velocity.Parent and speedValue then
+			velocity.VectorVelocity = direction * speedValue.Value
+		else
+			connection:Disconnect()
+		end
+	end)
+
+	-- Cleanup
+	Debris:AddItem(speedValue, duration)
+	Debris:AddItem(velocity, duration)
+	task.delay(duration, function()
+		if connection then
+			connection:Disconnect()
+		end
+	end)
+
+	return velocity, speedValue
+end
+
+function VelocityHandler:CreateAirJumpVelocity(rootPart, power, duration)
+	local config = {
+		constrainAxes = {X = false, Y = true, Z = false},
+		forceMultiplier = 1000
+	}
+
+	local velocity = self:CreateLinearVelocity(rootPart, config)
+	local speedValue = Instance.new("NumberValue")
+	speedValue.Value = power
+
+	local connection
+	connection = game:GetService("RunService").RenderStepped:Connect(function()
+		if velocity.Parent and speedValue then
+			velocity.VectorVelocity = rootPart.CFrame.UpVector * speedValue.Value
+		else
+			connection:Disconnect()
+		end
+	end)
+
+	-- Power curve tweening
+	task.delay(duration * 0.1, function()
+		if speedValue then
+			TweenService:Create(speedValue, TweenInfo.new(duration * 0.15), {Value = power * 1.35}):Play()
+			task.wait(duration * 0.4)
+			if speedValue then
+				TweenService:Create(speedValue, TweenInfo.new(duration * 0.25), {Value = power / 1.25}):Play()
+			end
+		end
+	end)
+
+	-- Cleanup
+	Debris:AddItem(speedValue, duration)
+	Debris:AddItem(velocity, duration)
+	task.delay(duration, function()
+		if connection then
+			connection:Disconnect()
+		end
+	end)
+
+	return velocity, speedValue
+end
+
+function VelocityHandler:CreateWallRunVelocity(rootPart, wallDirection, speed)
+	local config = {
+		constrainAxes = {X = true, Y = true, Z = true},
+		forceMultiplier = 1000
+	}
+
+	local velocity = self:CreateLinearVelocity(rootPart, config)
+	velocity.VectorVelocity = wallDirection * speed + Vector3.new(0, 10, 0)
+
+	return velocity
+end
+
+return VelocityHandler
