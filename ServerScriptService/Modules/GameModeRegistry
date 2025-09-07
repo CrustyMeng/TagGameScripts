@@ -1,0 +1,138 @@
+--[[
+SCRIPT_PATHS
+  Self: ServerScriptService/Modules/GameModeRegistry
+  Requires:
+    - ReplicatedStorage/Shared/GameConfig
+  Remotes:
+    - (none)
+  UsesConfigKeys:
+    - Debug.Enabled
+    - Debug.Channels
+    - ModeOverrides
+]]
+
+-- ServerScriptService/Modules/GameModeRegistry.lua
+-- Game mode management (simplified from original)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("GameConfig"))
+
+local GameModeRegistry = {}
+
+-- Current active mode
+local activeMode = nil
+
+-- Debug logging
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "Director") then
+		print("[Director] " .. message)
+	end
+end
+
+-- Apply mode overrides to config
+local function applyModeOverrides(modeName: string, modeConfig: table): table
+	local overrides = GameConfig.ModeOverrides[modeName]
+	if not overrides then return modeConfig end
+
+	-- Create merged config
+	local merged = {}
+	for k, v in pairs(modeConfig) do
+		merged[k] = v
+	end
+
+	for k, v in pairs(overrides) do
+		merged[k] = v
+		debugLog("Override applied: " .. modeName .. "." .. k .. " = " .. tostring(v))
+	end
+
+	return merged
+end
+
+-- Set the active game mode
+function GameModeRegistry.SetActiveMode(modeName: string, overrideTable: table?)
+	-- End current mode
+	if activeMode and activeMode.OnMatchEnd then
+		activeMode:OnMatchEnd()
+	end
+
+	activeMode = nil
+
+	-- Load new mode
+	local success, modeModule = pcall(function()
+		return require(script.Parent.Modes[modeName])
+	end)
+
+	if not success then
+		warn("GameModeRegistry: Failed to load mode '" .. modeName .. "': " .. tostring(modeModule))
+		return
+	end
+
+	-- Apply config overrides from GameConfig first
+	local config = applyModeOverrides(modeName, modeModule.Config or {})
+
+	-- Then apply any runtime overrides
+	if overrideTable then
+		for k, v in pairs(overrideTable) do
+			config[k] = v
+		end
+	end
+
+	modeModule.Config = config
+	activeMode = modeModule
+
+	debugLog("Activated mode: " .. modeName)
+
+	-- Set up event handlers for existing players
+	for _, existingPlayer in pairs(Players:GetPlayers()) do
+		if activeMode.OnPlayerAdded then
+			activeMode:OnPlayerAdded(existingPlayer)
+		end
+
+		-- Character events
+		existingPlayer.CharacterAdded:Connect(function(character)
+			if activeMode and activeMode.OnCharacterAdded then
+				activeMode:OnCharacterAdded(existingPlayer, character)
+			end
+		end)
+
+		-- Trigger for existing character
+		if existingPlayer.Character and activeMode.OnCharacterAdded then
+			activeMode:OnCharacterAdded(existingPlayer, existingPlayer.Character)
+		end
+	end
+
+	-- Start match with current players
+	local allPlayers = Players:GetPlayers()
+	if activeMode.OnMatchStart then
+		activeMode:OnMatchStart(allPlayers)
+	end
+end
+
+-- Get current active mode
+function GameModeRegistry.GetActiveMode()
+	return activeMode
+end
+
+-- Forward player events to active mode
+Players.PlayerAdded:Connect(function(player)
+	if activeMode and activeMode.OnPlayerAdded then
+		activeMode:OnPlayerAdded(player)
+	end
+
+	-- Handle character events
+	player.CharacterAdded:Connect(function(character)
+		if activeMode and activeMode.OnCharacterAdded then
+			activeMode:OnCharacterAdded(player, character)
+		end
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	if activeMode and activeMode.OnPlayerRemoving then
+		activeMode:OnPlayerRemoving(player)
+	end
+end)
+
+return GameModeRegistry
