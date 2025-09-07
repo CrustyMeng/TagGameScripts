@@ -1,0 +1,537 @@
+-- Game.StatersPlayerScripts.MovementSystemV7.CameraHandler.lua -- local script
+
+-- Always On, Constant-Distance Shoulder Offset, Cursor Hidden, Occlusion-Safe, Lock Enforcer
+-- Jump-stutter fix: occlusion smoothing only when occluded + optional focus smoothing.
+-- Easing: time-based exponential smoothing for rotation, zoom, and shoulder offsets.
+-- Live-play jitter hardening: BindToRenderStep + XZ focus smoothing.
+-- Character hard-lock to camera yaw (Shift-Lock style). Respawn-safe.
+-- ADDED: Configurable unlock toggle key
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+local player = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- ================== SETTINGS ==================
+local Settings = {
+	-- Camera feel
+	MinZoom = 14,
+	MaxZoom = 22,
+	DefaultZoom = 18,
+
+	-- Mouse sensitivity (separate for X/Y; falls back to Sensitivity if set)
+	Sensitivity = nil,   -- legacy single knob (leave nil to use X/Y below)
+	SensitivityX = 0.9,  -- left-right (yaw)
+	SensitivityY = 0.5,  -- up-down (pitch)
+
+	InvertY = true,
+	PitchMin = -15,
+	PitchMax = 69,
+	Shoulder = "Right",           -- "Right" or "Left"
+
+	-- Shoulder positioning
+	ShoulderOffset = 0,           -- left/right slide; true distance preserved
+	Height = 3,                   -- focus height above root
+	FOV = 90,
+
+	-- Extra nudges (optional)
+	ShoulderUp = 0.25,            -- camera vertical lift
+	ShoulderForward = 0.0,        -- small forward nudge toward the character (0 = none)
+	AimUp = 0.50,                 -- aim slightly above focus (helps avoid head blocking)
+
+	-- Keep Euclidean distance equal to current zoom when sliding sideways
+	KeepTrueZoom = true,
+
+	-- Character orientation behavior
+	LockCharacterToCamera = true, -- shift-lock hard lock
+	LockLerp = 1,                 -- 1 = perfect lock
+
+	-- (Only used if LockCharacterToCamera = false)
+	FaceMode = "WhenMoving",
+	FaceTurnLerp = 0.45,
+
+	-- Cursor
+	HideCursor = true,
+
+	-- UNLOCK TOGGLE SETTINGS
+	UnlockKey = Enum.KeyCode.LeftControl,  -- Key to toggle camera lock on/off
+	StartLocked = true,                    -- Whether to start with camera locked
+	ShowUnlockMessage = true,              -- Show message when toggling lock state
+
+	-- Occlusion handling
+	Occlusion = {
+		Enabled = true,
+		Padding = 0.35,
+		MinPull = 0.40,
+		Lerp = 0.60,
+		IgnoreTags = { "CameraIgnore", "Hitbox", "NoCam" },
+	},
+
+	-- Focus smoothing (helps live-server jitter)
+	FocusSmoothingY  = 0.18,
+	FocusSmoothingXZ = 0.14,
+
+	-- Robust lock (prevents Roblox core from flipping camera at spawn/focus changes)
+	EnforceLock = true,
+
+	-- Easing (time-based; smaller halflife = snappier)
+	Easing = {
+		Enabled = true,
+		RotationHalflife = 0.035,
+		ZoomHalflife     = 0.08,
+		ShoulderHalflife = 0.10,
+	},
+
+	-- Render priority offset (in case other scripts also bind camera)
+	RenderPriorityOffset = 0,
+}
+-- ==============================================
+
+-- Camera lock state
+local cameraLocked = Settings.StartLocked
+
+-- Zoom limits
+player.CameraMinZoomDistance = Settings.MinZoom
+player.CameraMaxZoomDistance = Settings.MaxZoom
+
+-- Player controls for move vector
+local function getControls()
+	local pm = player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")
+	return require(pm):GetControls()
+end
+local controls = getControls()
+
+-- ================== STATE (targets + smoothed currents) ==================
+local targetYaw, targetPitch = 0, -10           -- degrees
+local currentYaw, currentPitch = targetYaw, targetPitch
+
+local targetZoom = math.clamp(Settings.DefaultZoom, Settings.MinZoom, Settings.MaxZoom)
+local currentZoom = targetZoom
+
+local shoulderSign = (Settings.Shoulder == "Left") and -1 or 1
+local targetXOff = shoulderSign * Settings.ShoulderOffset
+local currentXOff = targetXOff
+
+local targetYOff = Settings.ShoulderUp
+local currentYOff = targetYOff
+
+local currentZOff = 0  -- computed each frame
+
+-- caches used by multiple functions (define early to avoid forward-ref issues)
+local lastCamPos = nil -- persist last position for smoothing (occlusion & safety)
+local lastWasOccluded = false
+local lastFocusVec = nil
+
+-- Build a dynamic ignore list for occlusion
+local function buildIgnoreList(char)
+	local list = { char }
+	for _, tag in ipairs(Settings.Occlusion.IgnoreTags or {}) do
+		for _, inst in ipairs(CollectionService:GetTagged(tag)) do
+			table.insert(list, inst)
+		end
+	end
+	return list
+end
+
+-- Show unlock message
+local function showMessage(text)
+	if not Settings.ShowUnlockMessage then return end
+
+	local sg = game:GetService("StarterGui")
+	sg:SetCore("ChatMakeSystemMessage", {
+		Text = text,
+		Color = Color3.fromRGB(255, 255, 0),
+		Font = Enum.Font.GothamBold,
+		FontSize = Enum.FontSize.Size18
+	})
+end
+
+-- helpers to fetch character/humanoid safely
+local function getCharHum()
+	local char = player.Character
+	if not char then return nil, nil end
+	return char, char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP(char)
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- easing helpers
+local LN2 = math.log(2)
+local function halflifeAlpha(halflife, dt)
+	if not halflife or halflife <= 0 then return 1 end
+	return 1 - math.exp(-LN2 * dt / halflife)
+end
+local function approach(current, target, halflife, dt)
+	local a = halflifeAlpha(halflife, dt)
+	return current + (target - current) * a
+end
+local function approachAngleDeg(currentDeg, targetDeg, halflife, dt)
+	local a = halflifeAlpha(halflife, dt)
+	local diff = ((targetDeg - currentDeg + 180) % 360) - 180
+	return currentDeg + diff * a
+end
+
+-- camera yaw (radians)
+local function cameraYaw(cf)
+	local _, y = (cf - cf.Position):ToOrientation()
+	return y
+end
+
+-- occlusion resolver (only smooth when occluded)
+local function resolveOcclusion(origin, desiredPos, ignoreList)
+	if not Settings.Occlusion.Enabled then
+		lastWasOccluded = false
+		lastCamPos = desiredPos
+		return desiredPos
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignoreList
+	params.IgnoreWater = true
+
+	local dir = desiredPos - origin
+	local hit = workspace:Raycast(origin, dir, params)
+
+	local targetPos = desiredPos
+	local nowOccluded = (hit ~= nil)
+
+	if nowOccluded then
+		local padding = Settings.Occlusion.Padding or 0.35
+		local pull = hit.Position - dir.Unit * padding
+		if (desiredPos - pull).Magnitude >= (Settings.Occlusion.MinPull or 0.3) then
+			targetPos = pull
+		end
+		if lastCamPos and (Settings.Occlusion.Lerp or 0) > 0 then
+			local a = Settings.Occlusion.Lerp
+			targetPos = lastCamPos + (targetPos - lastCamPos) * a
+		end
+	else
+		targetPos = desiredPos
+	end
+
+	lastWasOccluded = nowOccluded
+	lastCamPos = targetPos
+	return targetPos
+end
+
+-- focus smoothing (XZ + Y)
+local function smoothFocusVec(target)
+	if not lastFocusVec then
+		lastFocusVec = target
+		return target
+	end
+	local axz = Settings.FocusSmoothingXZ or 0
+	local ay  = Settings.FocusSmoothingY  or 0
+	if axz <= 0 and ay <= 0 then
+		lastFocusVec = target
+		return target
+	end
+
+	local lx, lz = lastFocusVec.X, lastFocusVec.Z
+	local tx, tz = target.X, target.Z
+	lx = lx + (tx - lx) * axz
+	lz = lz + (tz - lz) * axz
+
+	local ly, ty = lastFocusVec.Y, target.Y
+	ly = ly + (ty - ly) * ay
+
+	lastFocusVec = Vector3.new(lx, ly, lz)
+	return lastFocusVec
+end
+
+-- ===== recenterToCharacter moved ABOVE toggleLock (prevents nil call) =====
+local function recenterToCharacter(char)
+	if not cameraLocked then return end
+
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local focus = Vector3.new(hrp.Position.X, hrp.Position.Y + Settings.Height, hrp.Position.Z)
+	lastFocusVec = focus -- reset smoothing baselines
+
+	-- keep current yaw/pitch & offsets
+	local xOff, yOff = currentXOff, currentYOff
+	local zOff
+	if Settings.KeepTrueZoom then
+		local x2 = xOff * xOff
+		zOff = -math.sqrt(math.max(0, currentZoom * currentZoom - x2)) - Settings.ShoulderForward
+	else
+		zOff = -currentZoom + Settings.ShoulderForward
+	end
+	currentZOff = zOff
+
+	local rot = CFrame.Angles(0, math.rad(currentYaw), 0) * CFrame.Angles(math.rad(currentPitch), 0, 0)
+	local camPos = focus + rot:VectorToWorldSpace(Vector3.new(xOff, yOff, zOff))
+	lastCamPos = camPos
+
+	cam.CFrame = CFrame.new(camPos, focus + Vector3.new(0, Settings.AimUp, 0))
+end
+
+-- Setup camera lock
+local function applyLock()
+	if not cameraLocked then return end
+
+	cam.CameraType = Enum.CameraType.Scriptable
+	UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+	if Settings.HideCursor then
+		UIS.MouseIconEnabled = false
+	end
+
+	-- ensure humanoid rotation is disabled when we lock
+	local char, hum = getCharHum()
+	if hum then
+		hum.AutoRotate = not (Settings.LockCharacterToCamera and cameraLocked)
+	end
+end
+
+-- Release camera lock
+local function releaseLock()
+	cam.CameraType = Enum.CameraType.Custom
+	UIS.MouseBehavior = Enum.MouseBehavior.Default
+	UIS.MouseIconEnabled = true
+
+	-- hand control back to Core camera & restore character rotation
+	local char, hum = getCharHum()
+	if hum then
+		hum.AutoRotate = true
+		if cam.CameraSubject ~= hum then
+			cam.CameraSubject = hum
+		end
+	end
+
+	-- clear caches so we don't blend from stale points later
+	lastFocusVec, lastWasOccluded, lastCamPos = nil, false, nil
+end
+
+-- Toggle camera lock
+local function toggleLock()
+	cameraLocked = not cameraLocked
+
+	if cameraLocked then
+		-- sync yaw to current camera before taking control
+		local cy = math.deg(cameraYaw(cam.CFrame))
+		targetYaw, currentYaw = cy, cy
+
+		-- rebase smoothing to current character focus to avoid drift
+		local char = player.Character
+		local hrp = getHRP(char)
+		if hrp then
+			local focus = Vector3.new(hrp.Position.X, hrp.Position.Y + Settings.Height, hrp.Position.Z)
+			lastFocusVec, lastCamPos = focus, nil
+		end
+
+		applyLock()
+		if Settings.ShowUnlockMessage then
+			showMessage("Camera Locked")
+		end
+
+		-- one clean snap if we have a character
+		if char and hrp then
+			recenterToCharacter(char)
+		end
+	else
+		releaseLock()
+		if Settings.ShowUnlockMessage then
+			showMessage("Camera Unlocked")
+		end
+	end
+end
+
+-- Initial setup
+if cameraLocked then
+	applyLock()
+end
+
+-- Ensure humanoid AutoRotate matches our lock mode
+local function setupHumanoidForLock(char)
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.AutoRotate = not (Settings.LockCharacterToCamera and cameraLocked)
+	end
+end
+
+-- ===== Main update (BindToRenderStep to stabilize order) =====
+local function onRender(dt)
+	-- Skip camera updates if unlocked
+	if not cameraLocked then return end
+
+	local char = player.Character
+	local hrp = getHRP(char)
+	if not (char and hrp) then
+		-- If we temporarily lack HRP (streaming/ragdoll), don't write stale caches
+		return
+	end
+	local root = hrp
+	local hum = char:FindFirstChildOfClass("Humanoid")
+
+	-- Ensure humanoid is configured for lock mode (covers live toggles)
+	if hum and hum.AutoRotate == (Settings.LockCharacterToCamera and cameraLocked) then
+		hum.AutoRotate = not (Settings.LockCharacterToCamera and cameraLocked)
+	end
+
+	-- ----- INPUT → TARGETS -----
+	local delta = UIS:GetMouseDelta()
+	local sensX = (Settings.SensitivityX or Settings.Sensitivity or 1)
+	local sensY = (Settings.SensitivityY or Settings.Sensitivity or 1)
+
+	targetYaw   = targetYaw - (delta.X * sensX) -- degrees
+	local dy    = ((Settings.InvertY and delta.Y) or -delta.Y) * sensY
+	targetPitch = math.clamp(targetPitch + dy, Settings.PitchMin, Settings.PitchMax) -- degrees
+
+	-- Shoulder targets (react if dev flips side or edits Settings live)
+	local desiredXOff = ((Settings.Shoulder == "Left") and -1 or 1) * Settings.ShoulderOffset
+	local desiredYOff = Settings.ShoulderUp
+
+	-- ----- EASE TARGETS → CURRENTS -----
+	if Settings.Easing.Enabled then
+		currentYaw   = approachAngleDeg(currentYaw,   targetYaw,   Settings.Easing.RotationHalflife, dt)
+		currentPitch = approachAngleDeg(currentPitch, targetPitch, Settings.Easing.RotationHalflife, dt)
+		currentZoom  = approach(       currentZoom,   targetZoom,  Settings.Easing.ZoomHalflife,     dt)
+		currentXOff  = approach(       currentXOff,   desiredXOff, Settings.Easing.ShoulderHalflife, dt)
+		currentYOff  = approach(       currentYOff,   desiredYOff, Settings.Easing.ShoulderHalflife, dt)
+	else
+		currentYaw, currentPitch = targetYaw, targetPitch
+		currentZoom, currentXOff, currentYOff = targetZoom, desiredXOff, desiredYOff
+	end
+
+	-- ----- FOCUS (with XZ+Y smoothing) -----
+	local rawFocus = Vector3.new(root.Position.X, root.Position.Y + Settings.Height, root.Position.Z)
+	local focus    = smoothFocusVec(rawFocus)
+	local aimPoint = focus + Vector3.new(0, Settings.AimUp, 0)
+
+	-- ----- BUILD CAMERA OFFSET -----
+	local zTarget
+	if Settings.KeepTrueZoom then
+		local x2 = currentXOff * currentXOff
+		zTarget = -math.sqrt(math.max(0, currentZoom * currentZoom - x2)) - Settings.ShoulderForward
+	else
+		zTarget = -currentZoom + Settings.ShoulderForward
+	end
+
+	if Settings.Easing.Enabled then
+		currentZOff = approach(currentZOff, zTarget, Settings.Easing.ShoulderHalflife, dt)
+	else
+		currentZOff = zTarget
+	end
+
+	local camOffset = Vector3.new(currentXOff, currentYOff, currentZOff)
+
+	-- ----- ROTATION & DESIRED POS -----
+	local rot = CFrame.Angles(0, math.rad(currentYaw), 0) * CFrame.Angles(math.rad(currentPitch), 0, 0)
+	local desiredPos = focus + rot:VectorToWorldSpace(camOffset)
+
+	-- Distance safety: if we somehow drift far, snap our baseline
+	if lastCamPos then
+		local drift = (lastCamPos - desiredPos).Magnitude
+		local threshold = math.max(6, currentZoom * 2.5)
+		if drift > threshold then
+			lastFocusVec = rawFocus
+			lastCamPos = desiredPos
+		end
+	end
+
+	-- ----- OCCLUSION -----
+	local camPos = resolveOcclusion(focus, desiredPos, buildIgnoreList(char))
+
+	-- ----- APPLY CAMERA -----
+	cam.CFrame = CFrame.new(camPos, aimPoint)
+	cam.FieldOfView = Settings.FOV
+
+	-- ----- CHARACTER ORIENTATION LOCK -----
+	if hum then
+		if Settings.LockCharacterToCamera then
+			local cy = cameraYaw(cam.CFrame) -- radians
+			local desired = CFrame.new(root.Position) * CFrame.Angles(0, cy, 0)
+			local a = tonumber(Settings.LockLerp) or 1
+			if a >= 1 then
+				root.CFrame = desired
+			else
+				root.CFrame = root.CFrame:Lerp(desired, a)
+			end
+		else
+			local move = controls:GetMoveVector()
+			local moving = (move.Magnitude > 0.01)
+			local wantFace = Settings.FaceMode == "Always" or (Settings.FaceMode == "WhenMoving" and moving)
+			if wantFace then
+				local cy = cameraYaw(cam.CFrame)
+				local target = CFrame.new(root.Position) * CFrame.Angles(0, cy, 0)
+				root.CFrame = root.CFrame:Lerp(target, Settings.FaceTurnLerp)
+			end
+		end
+	end
+end
+
+-- Bind at camera priority to keep ordering consistent across Studio/Live
+local function bindIfNeeded()
+	RunService:BindToRenderStep(
+		"TSSL_Camera",
+		Enum.RenderPriority.Camera.Value + (Settings.RenderPriorityOffset or 0),
+		onRender
+	)
+end
+bindIfNeeded()
+
+-- Keep lock applied if core flips types (only when locked)
+if Settings.EnforceLock then
+	RunService.RenderStepped:Connect(function()
+		if cameraLocked and (cam.CameraType ~= Enum.CameraType.Scriptable or UIS.MouseBehavior ~= Enum.MouseBehavior.LockCenter) then
+			applyLock()
+		end
+	end)
+end
+
+-- Respawn handling: RECENTER and keep the binding alive
+player.CharacterAdded:Connect(function(char)
+	task.defer(function()
+		if cameraLocked then
+			applyLock()
+		end
+		setupHumanoidForLock(char)
+		-- reset caches for new character
+		lastFocusVec, lastWasOccluded, lastCamPos = nil, false, nil
+		-- keep current yaw from camera so it feels continuous
+		if cameraLocked then
+			local cy = math.deg(cameraYaw(cam.CFrame))
+			targetYaw, currentYaw = cy, cy
+		end
+		-- try to center on the new body immediately
+		local hrp = char:WaitForChild("HumanoidRootPart", 5)
+		if hrp then recenterToCharacter(char) end
+	end)
+end)
+
+-- Don't kill the camera loop on death; just clear smoothing baselines
+player.CharacterRemoving:Connect(function()
+	lastFocusVec, lastWasOccluded, lastCamPos = nil, false, nil
+end)
+
+-- Mouse wheel zoom → target (only when locked)
+UIS.InputChanged:Connect(function(input, gp)
+	if gp or not cameraLocked then return end
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		targetZoom = math.clamp(targetZoom - input.Position.Z, Settings.MinZoom, Settings.MaxZoom)
+	end
+end)
+
+-- Handle unlock key input
+UIS.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Settings.UnlockKey then
+		toggleLock()
+	end
+end)
+
+-- Window focus safety (only when locked)
+UIS.WindowFocused:Connect(function()
+	if cameraLocked then applyLock() end
+end)
+UIS.WindowFocusReleased:Connect(function()
+	if cameraLocked then applyLock() end
+end)
