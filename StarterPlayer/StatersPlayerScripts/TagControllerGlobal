@@ -1,0 +1,290 @@
+--[[
+SCRIPT_PATHS
+  Self: StarterPlayer/StarterPlayerScripts/TagControllerGlobal
+  Requires:
+    - ReplicatedStorage/Shared/GameConfig
+  Remotes:
+    - ReplicatedStorage/Remotes/FireRay (RemoteEvent, name from GameConfig.RemoteNames.FireRay)
+    - ReplicatedStorage/Remotes/State (RemoteEvent, name from GameConfig.RemoteNames.State)
+  UsesConfigKeys:
+    - Tagging.ToolName
+    - Tagging.Client.BlockEmptyShots
+    - Tagging.Client.DryFireSoundName
+    - Tagging.Debug.ShowRays
+    - Tagging.Debug.ShowTime
+    - Tagging.Debug.Thickness
+    - Tagging.RandomSpread
+    - Tagging.RayCount
+    - Tagging.ConeAngleDeg
+    - Tagging.OriginOffset
+    - Tagging.MaxRange
+    - Debug.Enabled
+    - Debug.Channels
+    - RemoteNames.FireRay
+    - RemoteNames.State
+]]
+
+-- StarterPlayer/StarterPlayerScripts/TagControllerGlobal.client.lua
+-- Global tag tool controller (not tool-specific)
+
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local GameConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("GameConfig"))
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- State tracking
+local currentAmmo = GameConfig.Tagging.StartAmmo
+local maxAmmo = GameConfig.Tagging.MaxAmmo
+local isReloading = false
+
+-- Get remotes
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local fireRemote = remotes:WaitForChild(GameConfig.RemoteNames.FireRay)
+local stateRemote = remotes:WaitForChild(GameConfig.RemoteNames.State)
+
+-- Debug logging
+local function debugLog(message: string)
+	if GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels, "Tag") then
+		print("[Tag] " .. message)
+	end
+end
+
+-- Play dry fire sound
+local function playDryFire()
+	local soundName = GameConfig.Tagging.Client.DryFireSoundName
+	if not soundName then return end
+
+	local sound = nil
+	-- Look for sound in various locations
+	local currentTool = player.Character and player.Character:FindFirstChild(GameConfig.Tagging.ToolName)
+	if currentTool then
+		sound = currentTool:FindFirstChild(soundName)
+	end
+
+	if not sound then
+		sound = ReplicatedStorage:FindFirstChild(soundName)
+	end
+
+	if sound and sound:IsA("Sound") then
+		local clone = sound:Clone()
+		clone.Parent = camera
+		clone:Play()
+		Debris:AddItem(clone, 2)
+	end
+end
+
+-- Visual ray debugging
+local function drawSegment(startPos: Vector3, endPos: Vector3, life: number?, thickness: number?)
+	if not GameConfig.Tagging.Debug.ShowRays then return end
+
+	local dist = (endPos - startPos).Magnitude
+	if dist <= 1e-4 then return end
+
+	local part = Instance.new("Part")
+	part.Name = "DebugRay"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	part.Transparency = 0.25
+	part.Color = Color3.fromRGB(255, 255, 0)
+	part.Size = Vector3.new(
+		thickness or GameConfig.Tagging.Debug.Thickness,
+		thickness or GameConfig.Tagging.Debug.Thickness,
+		dist
+	)
+	part.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -dist/2)
+	part.Parent = camera -- Client-only visual
+	Debris:AddItem(part, life or GameConfig.Tagging.Debug.ShowTime)
+end
+
+-- Generate cone spread directions
+local rng = Random.new()
+
+local function uniformConeDirections(centerCF: CFrame, count: number, totalAngleDeg: number): {Vector3}
+	local dirs = {}
+	local halfAngle = math.rad(totalAngleDeg) * 0.5
+	local forward, right, up = centerCF.LookVector, centerCF.RightVector, centerCF.UpVector
+
+	for _ = 1, count do
+		local cosHalf = math.cos(halfAngle)
+		local cosTheta = rng:NextNumber(cosHalf, 1)
+		local theta = math.acos(cosTheta)
+		local phi = rng:NextNumber(0, math.pi * 2)
+
+		local sinTheta = math.sin(theta)
+		local localDir = (right * (sinTheta * math.cos(phi))) + 
+			(up * (sinTheta * math.sin(phi))) + 
+			(forward * cosTheta)
+		table.insert(dirs, localDir.Unit)
+	end
+	return dirs
+end
+
+local function evenConeDirections(centerCF: CFrame, count: number, totalAngleDeg: number): {Vector3}
+	if count <= 1 then return {centerCF.LookVector.Unit} end
+
+	local dirs = {centerCF.LookVector.Unit}
+	local halfAngle = math.rad(totalAngleDeg) * 0.5
+	local forward, right, up = centerCF.LookVector, centerCF.RightVector, centerCF.UpVector
+	local ringCount = count - 1
+
+	for i = 1, ringCount do
+		local phi = (i - 1) / ringCount * math.pi * 2
+		local theta = halfAngle
+		local sinTheta = math.sin(theta)
+		local localDir = (right * (sinTheta * math.cos(phi))) + 
+			(up * (sinTheta * math.sin(phi))) + 
+			(forward * math.cos(theta))
+		table.insert(dirs, localDir.Unit)
+	end
+	return dirs
+end
+
+-- Get firing origin and aim direction
+local function getOriginAndAim(character: Model): (Vector3?, CFrame?)
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart then return nil, nil end
+
+	-- Calculate origin from config offset
+	local offset = GameConfig.Tagging.OriginOffset
+	local origin = humanoidRootPart.Position + humanoidRootPart.CFrame:VectorToWorldSpace(
+		Vector3.new(offset[1], offset[2], offset[3])
+	)
+
+	-- Aim using camera direction
+	local lookDirection = camera.CFrame.LookVector
+	local centerCF = CFrame.lookAt(origin, origin + lookDirection, humanoidRootPart.CFrame.UpVector)
+
+	return origin, centerCF
+end
+
+-- Handle tool activation (firing)
+local function onToolActivated(tool: Tool)
+	-- Check if we should block the shot
+	if GameConfig.Tagging.Client.BlockEmptyShots then
+		local lockDuringReload = GameConfig.Tagging.LockDuringReload
+		if currentAmmo <= 0 or (lockDuringReload and isReloading) then
+			playDryFire()
+			return
+		end
+	end
+
+	local character = tool.Parent
+	if not character or not character:IsA("Model") then return end
+
+	local origin, centerCF = getOriginAndAim(character)
+	if not origin or not centerCF then return end
+
+	-- Generate spread pattern
+	local directions
+	if GameConfig.Tagging.RandomSpread then
+		directions = uniformConeDirections(centerCF, GameConfig.Tagging.RayCount, GameConfig.Tagging.ConeAngleDeg)
+	else
+		directions = evenConeDirections(centerCF, GameConfig.Tagging.RayCount, GameConfig.Tagging.ConeAngleDeg)
+	end
+
+	-- Client-side raycast for visuals only (server is authoritative)
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+	raycastParams.FilterDescendantsInstances = {character}
+
+	local maxRange = GameConfig.Tagging.MaxRange
+
+	for _, direction in pairs(directions) do
+		local raycastResult = workspace:Raycast(origin, direction * maxRange, raycastParams)
+		local endPos = raycastResult and raycastResult.Position or (origin + direction * maxRange)
+		drawSegment(origin, endPos)
+	end
+
+	-- Send fire request to server
+	fireRemote:FireServer(origin, directions)
+
+	debugLog("Fired tag tool")
+end
+
+-- Handle state updates from server
+local function onStateUpdate(payload: table)
+	-- Update local state cache
+	if payload.ammo ~= nil then currentAmmo = payload.ammo end
+	if payload.max ~= nil then maxAmmo = payload.max end
+	if payload.reloading ~= nil then isReloading = payload.reloading end
+
+	-- Handle different message types
+	if payload.reloading ~= nil then
+		local status = payload.reloading and "Reloading..." or "Ready"
+		debugLog(status .. " (Ammo: " .. currentAmmo .. "/" .. maxAmmo .. ")")
+		return
+	end
+
+	if payload.error then
+		if payload.error == "cooldown" then
+			debugLog("Cooldown: " .. string.format("%.2f", payload.timeLeft or 0) .. "s")
+		elseif payload.error == "empty" then
+			debugLog("Empty! Auto-reloading...")
+		elseif payload.error == "reloading" then
+			debugLog("Still reloading... (" .. currentAmmo .. "/" .. maxAmmo .. ")")
+		end
+		return
+	end
+
+	if payload.ok then
+		local hitText = payload.tagged and " (HIT!)" or ""
+		debugLog("Shot fired. Ammo: " .. currentAmmo .. hitText)
+	end
+end
+
+-- Set up tool event handlers
+local function setupTool(tool: Tool)
+	-- Connect activation
+	tool.Activated:Connect(function()
+		onToolActivated(tool)
+	end)
+
+	debugLog("Tool controller setup for: " .. tool.Name)
+end
+
+-- Monitor for tag tools being equipped
+local function onCharacterAdded(character: Model)
+	character.ChildAdded:Connect(function(child: Instance)
+		if child:IsA("Tool") and child.Name == GameConfig.Tagging.ToolName then
+			setupTool(child)
+		end
+	end)
+
+	-- Check if tool already exists
+	local existingTool = character:FindFirstChild(GameConfig.Tagging.ToolName)
+	if existingTool and existingTool:IsA("Tool") then
+		setupTool(existingTool)
+	end
+end
+
+-- Monitor backpack for tools too
+local function onBackpackChildAdded(child: Instance)
+	if child:IsA("Tool") and child.Name == GameConfig.Tagging.ToolName then
+		setupTool(child)
+	end
+end
+
+-- Initialize
+if player.Character then
+	onCharacterAdded(player.Character)
+end
+
+player.CharacterAdded:Connect(onCharacterAdded)
+
+if player.Backpack then
+	player.Backpack.ChildAdded:Connect(onBackpackChildAdded)
+end
+
+-- Connect to state remote
+stateRemote.OnClientEvent:Connect(onStateUpdate)
+
+debugLog("Global tag controller initialized")
