@@ -1,0 +1,287 @@
+--[[
+SCRIPT_PATHS
+  Self: ServerScriptService/Modules/TagService.lua
+  Requires:
+    - ReplicatedStorage/Modules/Shared/GameConfig
+    - ReplicatedStorage/Modules/Shared/Movement/RaycastUtil
+    - ServerScriptService/Modules/GameDirector.lua
+    - ServerScriptService/Modules/TeamsService.lua
+  Remotes:
+    - ReplicatedStorage/Remotes/ReportTag (RemoteEvent, name from GameConfig.RemoteNames.ReportTag)
+  UsesConfigKeys:
+    - Debug.Enabled
+    - Debug.Channels
+    - Tagging.MaxRange
+    - Tagging.EnableLOS
+    - Tagging.LineOfSight.IgnoreNonCollidable
+    - Tagging.LineOfSight.TransparencyThreshold
+    - Tagging.LineOfSight.IgnoreNames
+    - Tagging.LineOfSight.IgnoreNameContains
+    - Teams.FriendlyFire
+    - RemoteNames.ReportTag
+    - Folders.Remotes
+]]
+
+-- ServerScriptService/Modules/TagService.lua
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+-- Shared layout under ReplicatedStorage.Modules.Shared.*
+local GameConfig  = require(ReplicatedStorage.Modules.Shared.GameConfig)
+local RaycastUtil = require(ReplicatedStorage.Modules.Shared.Movement.RaycastUtil)
+
+local GameDirector = require(ServerScriptService.Modules.GameDirector)
+local TeamsService  = require(ServerScriptService.Modules.TeamsService)
+
+local TagService = {}
+
+local taggedEvent = Instance.new("BindableEvent")
+TagService.Tagged = taggedEvent.Event
+
+local function Cfg(path)
+	local node = GameConfig
+	for seg in string.gmatch(path, "[^%.]+") do
+		node = node and node[seg]
+	end
+	return node
+end
+
+local function debugLog(message)
+	if GameConfig.Debug and GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels or {}, "Tag") then
+		print("[Tag] " .. message)
+	end
+end
+
+-- Prefer Humanoid.RootPart (movement systems often swap/rename root)
+local function getRootPart(char)
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.RootPart then return hum.RootPart end
+	return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getAimPart(char)
+	if not char then return nil end
+	return char:FindFirstChild("Head") or getRootPart(char)
+end
+
+local function hitCountsAsVictim(hitInstance, victimChar)
+	if not (hitInstance and victimChar) then return false end
+	if hitInstance:IsDescendantOf(victimChar) then
+		return true
+	end
+	local acc = hitInstance:FindFirstAncestorOfClass("Accessory")
+	if acc and acc:IsDescendantOf(victimChar) then
+		return true
+	end
+	local arp = hitInstance:IsA("BasePart") and hitInstance.AssemblyRootPart or nil
+	if arp and arp:IsDescendantOf(victimChar) then
+		return true
+	end
+	return false
+end
+
+local function isSoftBlocker(part)
+	if not part or not part:IsA("BasePart") then return false end
+	local ignoreNonCollidable = Cfg("Tagging.LineOfSight.IgnoreNonCollidable")
+	local transpThresh = Cfg("Tagging.LineOfSight.TransparencyThreshold") or 0
+	local ignoreNames = Cfg("Tagging.LineOfSight.IgnoreNames") or {}
+	local ignoreContains = Cfg("Tagging.LineOfSight.IgnoreNameContains") or {}
+
+	if ignoreNonCollidable and part.CanCollide == false then
+		return true
+	end
+	if transpThresh > 0 and part.Transparency >= transpThresh then
+		return true
+	end
+	for _, n in ipairs(ignoreNames) do
+		if part.Name == n then
+			return true
+		end
+	end
+	local lname = string.lower(part.Name)
+	for _, sub in ipairs(ignoreContains) do
+		if lname:find(string.lower(sub), 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function buildAttackerBlacklist(attackerChar)
+	local list = { attackerChar }
+	local commonNames = { "Hitbox", "CharacterHitbox", "Collision", "Collider", "RootHitbox", "ProxyRoot" }
+	for _, nm in ipairs(commonNames) do
+		local found = attackerChar:FindFirstChild(nm, true)
+		if found then table.insert(list, found) end
+	end
+	for _, d in ipairs(attackerChar:GetDescendants()) do
+		if d:IsA("BasePart") and (d.Name == "Handle" or d.Name:lower():find("handle")) then
+			table.insert(list, d)
+		end
+	end
+	return list
+end
+
+-- SINGLE RAY with robust guards. Treat (hit and hit.Instance==nil) as clear (no blocker).
+local function castClear(originPart, targetPos, attackerChar, victimChar)
+	local origin = originPart.Position
+	local vec = (targetPos - origin)
+	local dist = vec.Magnitude
+	if dist <= 0 then return true end
+
+	local hit = RaycastUtil:Cast(originPart, vec.Unit, dist, {
+		blacklist = buildAttackerBlacklist(attackerChar),
+		visualize = GameConfig.Debug and table.find(GameConfig.Debug.Channels or {}, "Raycast") ~= nil
+	})
+
+	-- No result at all: clear.
+	if not hit then
+		return true
+	end
+
+	-- Some RaycastUtil impls may return a table missing Instance. Treat as clear to avoid false blocks.
+	local inst = hit.Instance
+	if inst == nil then
+		if GameConfig.Debug and GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels or {}, "Tag") then
+			print("[Tag][LOS] ray result without Instance; treating as clear")
+		end
+		return true
+	end
+
+	-- Clear if we hit the victim (character or accessories)
+	if hitCountsAsVictim(inst, victimChar) then
+		return true
+	end
+
+	-- Ignore soft blockers (non-collidable/transparent/name-matched)
+	if isSoftBlocker(inst) then
+		return true
+	end
+
+	if GameConfig.Debug and GameConfig.Debug.Enabled and table.find(GameConfig.Debug.Channels or {}, "Tag") then
+		local nameSafe = (typeof(inst.GetFullName) == "function") and inst:GetFullName() or tostring(inst)
+		local canCollide = (typeof(inst) == "Instance" and inst:IsA("BasePart")) and inst.CanCollide or "?"
+		local transp = (typeof(inst) == "Instance" and inst:IsA("BasePart")) and inst.Transparency or "?"
+		print(("[Tag][LOS] blocked by %s (CanCollide=%s, Transparency=%s) @ %s")
+			:format(nameSafe, tostring(canCollide), tostring(transp), tostring(hit.Position)))
+	end
+	return false
+end
+
+-- Triple-ray LOS
+local function validateLineOfSight(attackerChar, victimChar)
+	if not (GameConfig.Tagging and GameConfig.Tagging.EnableLOS) then
+		return true
+	end
+
+	local aAim = getAimPart(attackerChar)
+	local vHead = victimChar and victimChar:FindFirstChild("Head")
+	local vRoot = getRootPart(victimChar)
+
+	if not aAim or not (vHead or vRoot) then
+		return false
+	end
+
+	local targets = {}
+	if vHead then table.insert(targets, vHead.Position) end
+	if vRoot then table.insert(targets, vRoot.Position + Vector3.new(0, 0.35, 0)) end
+	if vHead then table.insert(targets, vHead.Position + Vector3.new(0, 0.2, 0)) end
+
+	for _, t in ipairs(targets) do
+		if castClear(aAim, t, attackerChar, victimChar) then
+			return true
+		end
+	end
+	return false
+end
+
+local function validateTag(attacker, victim)
+	if GameDirector.GetState and GameDirector.GetState() ~= GameDirector.States.Match then
+		return false, "Match not active"
+	end
+
+	if not attacker or not attacker.Parent then
+		return false, "Invalid attacker"
+	end
+	if not victim or not victim.Parent then
+		return false, "Invalid victim"
+	end
+	local aChar, vChar = attacker.Character, victim.Character
+	if not (aChar and vChar) then
+		return false, "Missing character"
+	end
+
+	local aRoot = getRootPart(aChar)
+	local vRoot = getRootPart(vChar)
+	if not (aRoot and vRoot) then
+		return false, "Missing RootPart"
+	end
+
+	local maxRange = (GameConfig.Tagging and GameConfig.Tagging.MaxRange) or 30
+	local distance = (aRoot.Position - vRoot.Position).Magnitude
+	if distance > maxRange then
+		return false, ("Too far (%d > %d)"):format(math.floor(distance), maxRange)
+	end
+
+	local attackerRole = TeamsService.GetPlayerRole and TeamsService.GetPlayerRole(attacker) or "Player"
+	local victimRole   = TeamsService.GetPlayerRole and TeamsService.GetPlayerRole(victim)   or "Player"
+
+	if attackerRole ~= "Tagger" then
+		return false, "Only taggers can tag"
+	end
+
+	local allowFriendly = (GameConfig.Teams and GameConfig.Teams.FriendlyFire) or false
+	if (not allowFriendly) and (attackerRole == victimRole) then
+		return false, "Friendly fire disabled"
+	end
+
+	if not validateLineOfSight(aChar, vChar) then
+		return false, "No line of sight"
+	end
+
+	return true
+end
+
+function TagService.ValidateAndApplyTag(attacker, victim, payload)
+	local valid, reason = validateTag(attacker, victim)
+	if not valid then
+		debugLog(("Tag rejected: %s → %s (%s)"):format(attacker and attacker.Name or "?", victim and victim.Name or "?", reason or "unknown"))
+		return false
+	end
+	debugLog(("Tag confirmed: %s → %s"):format(attacker.Name, victim.Name))
+	taggedEvent:Fire(attacker, victim, payload)
+	return true
+end
+
+function TagService.ReportTag(attacker, victim, payload)
+	return TagService.ValidateAndApplyTag(attacker, victim, payload)
+end
+
+do
+	local remotesFolderName = (GameConfig.Folders and GameConfig.Folders.Remotes) or "Remotes"
+	local remotes = ReplicatedStorage:FindFirstChild(remotesFolderName)
+	if remotes then
+		local reportName = (GameConfig.RemoteNames and GameConfig.RemoteNames.ReportTag) or "ReportTag"
+		local tagRemote = remotes:FindFirstChild(reportName)
+		if tagRemote and tagRemote:IsA("RemoteEvent") then
+			tagRemote.OnServerEvent:Connect(function(player, victimRef, payload)
+				local victim = nil
+				if typeof(victimRef) == "Instance" and victimRef:IsA("Player") then
+					victim = victimRef
+				elseif typeof(victimRef) == "number" then
+					victim = Players:GetPlayerByUserId(victimRef)
+				elseif typeof(victimRef) == "string" then
+					victim = Players:FindFirstChild(victimRef)
+				end
+				if victim then
+					TagService.ValidateAndApplyTag(player, victim, payload)
+				end
+			end)
+		end
+	end
+end
+
+return TagService
