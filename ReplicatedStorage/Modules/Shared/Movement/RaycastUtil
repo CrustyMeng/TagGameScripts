@@ -18,13 +18,17 @@ local Debris = game:GetService("Debris")
 function RaycastUtil:Cast(originPart, direction, range, options)
 	options = options or {}
 
-	-- Normalized filter to use character only
-	local blacklist = options.blacklist or {workspace.Characters}
+	-- Safe blacklist handling - require explicit character exclusion
+	local blacklist = options.blacklist or {}
+	if typeof(blacklist) ~= "table" then
+		blacklist = {blacklist}
+	end
+
 	local horizontalOffset = options.horizontalOffset or 0
 	local verticalOffset = options.verticalOffset or 0
 	local visualize = options.visualize or false
 
-	-- Setup raycast parameters (normalized to use Exclude)
+	-- Setup raycast parameters
 	local raycastParams = RaycastParams.new()
 	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 	raycastParams.FilterDescendantsInstances = blacklist
@@ -56,12 +60,16 @@ function RaycastUtil:Cast(originPart, direction, range, options)
 	return nil
 end
 
--- NEW: Cast from specific face of a box part
+-- Cast from specific face of a box part
 function RaycastUtil:CastFromFace(boxPart, face, range, options)
 	options = options or {}
 
-	-- Normalized filter
-	local blacklist = options.blacklist or {workspace.Characters}
+	-- Safe blacklist handling
+	local blacklist = options.blacklist or {}
+	if typeof(blacklist) ~= "table" then
+		blacklist = {blacklist}
+	end
+
 	local visualize = options.visualize or false
 
 	-- Setup raycast parameters
@@ -119,7 +127,7 @@ function RaycastUtil:CastFromFace(boxPart, face, range, options)
 	return nil
 end
 
--- NEW: Cast 8 rays in star pattern on XZ plane
+-- Cast 8 rays in star pattern on XZ plane
 function RaycastUtil:CastStar(boxPart, range, options)
 	options = options or {}
 
@@ -128,17 +136,29 @@ function RaycastUtil:CastStar(boxPart, range, options)
 		"Forward", "Back", "Left", "Right"
 	}
 
-	-- Add diagonals if enabled
-	local config = require(game.ReplicatedStorage.Modules.MovementSystemV7.Config)
-	if config.Hitbox.UseDiagonals then
+	-- Add diagonals if enabled (check if Config is available)
+	local hasDiagonals = true -- Default to true since original had this
+	local success, config = pcall(function()
+		return require(game.ReplicatedStorage.Modules.MovementSystemV7.Config)
+	end)
+
+	if success and config and config.Hitbox then
+		hasDiagonals = config.Hitbox.UseDiagonals
+	end
+
+	if hasDiagonals then
 		table.insert(directions, "ForwardLeft")
 		table.insert(directions, "ForwardRight") 
 		table.insert(directions, "BackLeft")
 		table.insert(directions, "BackRight")
 	end
 
-	-- Normalized filter
-	local blacklist = options.blacklist or {workspace.Characters}
+	-- Safe blacklist handling
+	local blacklist = options.blacklist or {}
+	if typeof(blacklist) ~= "table" then
+		blacklist = {blacklist}
+	end
+
 	local visualize = options.visualize or false
 
 	-- Setup raycast parameters
@@ -191,12 +211,12 @@ function RaycastUtil:CastStar(boxPart, range, options)
 	return results
 end
 
--- NEW: Get parts overlapping with hitbox
+-- Get parts overlapping with hitbox
 function RaycastUtil:GetPartsInHitbox(boxPart, overlapParams)
 	if not overlapParams then
 		overlapParams = OverlapParams.new()
 		overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-		overlapParams.FilterDescendantsInstances = {workspace.Characters}
+		overlapParams.FilterDescendantsInstances = {} -- Safe default
 	end
 
 	local parts = workspace:GetPartsInPart(boxPart, overlapParams)
