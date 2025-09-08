@@ -1,3 +1,42 @@
+--[[
+SCRIPT_PATHS
+  Self: ServerScriptService/Modules/MatchLoop
+  Requires:
+    - ReplicatedStorage/Shared/GameConfig
+    - ServerScriptService/Modules/GameDirector
+    - ServerScriptService/Modules/HUDManager
+    - ServerScriptService/Modules/MapService
+    - ServerScriptService/Modules/TeamsService
+    - ServerScriptService/Modules/LoadoutService
+    - ServerScriptService/Modules/TagService
+    - ServerScriptService/Modules/GameModeRegistry
+  Remotes:
+    - ReplicatedStorage/Remotes/RoundTime (RemoteEvent, name from GameConfig.RemoteNames.RoundTime)
+    - ReplicatedStorage/Remotes/LobbyTimerUpdate (RemoteEvent, name from GameConfig.RemoteNames.LobbyTimerUpdate)
+    - ReplicatedStorage/Remotes/LobbyVoteOpen (RemoteEvent, name from GameConfig.RemoteNames.LobbyVoteOpen)
+    - ReplicatedStorage/Remotes/MidJoinClosed (RemoteEvent, name from GameConfig.RemoteNames.MidJoinClosed)
+  UsesConfigKeys:
+    - Lobby.MinPlayers
+    - Lobby.LobbyCountdownSeconds
+    - Lobby.AutoLoop
+    - Match.RoundDurationSeconds
+    - Match.HalftimeCutoffFraction
+    - Round.PostGameSeconds
+    - Round.AutoRestart
+    - HUD.TimerUpdateHz
+    - FeatureToggles.LobbyAutoLoop
+    - FeatureToggles.MidJoin
+    - FeatureToggles.MapVote
+    - FeatureToggles.ModeVote
+    - Voting.DefaultMode
+    - Voting.DefaultMap
+    - Voting.Enabled
+    - Voting.MapOptions
+    - Voting.ModeOptions
+    - Voting.DurationSeconds
+    - RemoteNames.*
+]]
+
 -- ServerScriptService/Modules/MatchLoop.lua
 -- Timer management and match lifecycle (respawn-based movement)
 
@@ -278,11 +317,11 @@ function MatchLoop.EndMatch(reason: string)
 	-- Clean up match state
 	local TeamsService = require(ServerScriptService.Modules.TeamsService)
 	local LoadoutService = require(ServerScriptService.Modules.LoadoutService)
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
+	local TagService = require(ServerScriptService.Modules.TagService)
 
 	TeamsService.MoveAllToSpectators()
 	LoadoutService.RemoveAllTools()
-	TagEffects.UnfreezeAll()
+	TagService.UnfreezeAllPlayers() -- FIXED: Use TagService instead of TagEffects
 
 	-- Reset mid-join timing
 	matchStartTime = 0
