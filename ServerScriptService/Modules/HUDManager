@@ -22,20 +22,9 @@ local GameConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChil
 
 local HUDManager = {}
 
--- Create remote for HUD updates
-local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-if not remotes then
-	remotes = Instance.new("Folder")
-	remotes.Name = "Remotes"
-	remotes.Parent = ReplicatedStorage
-end
-
-local hudUpdateRemote = remotes:FindFirstChild(GameConfig.RemoteNames.UpdateHUD)
-if not hudUpdateRemote then
-	hudUpdateRemote = Instance.new("RemoteEvent")
-	hudUpdateRemote.Name = GameConfig.RemoteNames.UpdateHUD
-	hudUpdateRemote.Parent = remotes
-end
+-- Wait for remote (created by GameStartup)
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local hudUpdateRemote = remotes:WaitForChild(GameConfig.RemoteNames.UpdateHUD)
 
 -- Debug logging
 local function debugLog(message: string)
