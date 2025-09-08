@@ -1,9 +1,29 @@
+--[[
+SCRIPT_PATHS
+  Self: ServerScriptService/GameStartup
+  Requires:
+    - ReplicatedStorage/Shared/GameConfig
+    - ServerScriptService/Modules/GameDirector
+    - ServerScriptService/Modules/TeamsService
+    - ServerScriptService/Modules/MatchLoop
+  Remotes:
+    - Creates all remotes from GameConfig.RemoteNames
+  UsesConfigKeys:
+    - RemoteNames.*
+    - FeatureToggles.MidJoin
+    - Tagging.ToolName
+    - FreezeTag.MinPlayersToStart
+    - Match.RoundDurationSeconds
+    - Hitbox.CollisionGroup
+]]
+
 -- ServerScriptService/GameStartup.server.lua
 -- Replace your existing GameBootstrap and TagServer with this single startup script
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local ServerScriptService = game:GetService("ServerScriptService")
+local PhysicsService = game:GetService("PhysicsService")
 
 -- Initialize the new game system
 local GameDirector = require(ServerScriptService.Modules:WaitForChild("GameDirector"))
@@ -18,6 +38,22 @@ local function Cfg(path)
 		if not value then break end
 	end
 	return value
+end
+
+-- Initialize collision groups
+local function initializeCollisionGroups()
+	local groupName = Cfg("Hitbox.CollisionGroup") or "Hitboxes"
+
+	-- Create collision group if it doesn't exist
+	local success, _ = pcall(function()
+		PhysicsService:GetCollisionGroupId(groupName)
+	end)
+
+	if not success then
+		PhysicsService:RegisterCollisionGroup(groupName)
+		PhysicsService:CollisionGroupSetCollidable(groupName, "Default", false)
+		print("Created collision group:", groupName)
+	end
 end
 
 -- Wire up remotes from config
@@ -58,6 +94,9 @@ local function WireUpFromConfig()
 
 	print("Remotes wired up from config")
 end
+
+-- Initialize collision groups first
+initializeCollisionGroups()
 
 -- Move Tagger tool if needed (same logic as your old bootstrap)
 local taggerTool = game:GetService("StarterPack"):FindFirstChild(Cfg("Tagging.ToolName"))
