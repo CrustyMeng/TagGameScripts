@@ -152,6 +152,7 @@ local GameConfig = {
 		-- Fire rate - RPM takes priority over cooldown
 		FireRateRPM = 500,               -- Rounds per minute (0 to disable)
 		CooldownSeconds = 0.8,           -- Fallback cooldown if RPM <= 0
+		OneTagPerShot = false,           -- Stop after first valid hit per shot
 
 		-- Ammo system
 		MaxAmmo = 6,                     -- Maximum ammo capacity
@@ -167,7 +168,7 @@ local GameConfig = {
 			IgnoreNames = { "AccessoryHandle" },-- exact matches
 			IgnoreNameContains = { "hitbox", "proxy", "collider", "ghost", "hb" },
 		},
-		
+
 		Client = {
 			BlockEmptyShots = true,      -- Prevent firing when empty
 			DryFireSoundName = "DryClick" -- Sound name for empty shots
@@ -179,6 +180,11 @@ local GameConfig = {
 			ShowTime = 0.15,             -- Ray display duration
 			Thickness = 0.12             -- Ray line thickness
 		}
+	},
+
+	-- ==================== HITBOX SETTINGS ====================
+	Hitbox = {
+		CollisionGroup = "Hitboxes",     -- Collision group name for hitboxes
 	},
 
 	-- ==================== FREEZETAG MODE ====================
