@@ -5,7 +5,7 @@ SCRIPT_PATHS
     - ReplicatedStorage/Shared/GameConfig
     - ServerScriptService/Modules/TeamsService
     - ServerScriptService/Modules/LoadoutService
-    - ReplicatedStorage/Modules/Game/TagEffects
+    - ServerScriptService/Modules/TagService
     - ServerScriptService/Modules/MatchLoop
   Remotes:
     - (none - uses TagService.Tagged event)
@@ -39,6 +39,7 @@ local roundActive = false
 local waitingForPlayers = false
 local rescueTimers: {[string]: {rescuer: Player, frozen: Player, startTime: number}} = {}
 local rescueConnection = nil
+local tagConnection = nil -- Track the tag connection
 
 -- Config helper
 local function Cfg(path)
@@ -106,38 +107,47 @@ end
 local function getUnfrozenPlayerCount(): number
 	local count = 0
 	local TeamsService = require(script.Parent.Parent.TeamsService)
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
+	local TagService = require(script.Parent.Parent.TagService)
 
 	for _, player in pairs(Players:GetPlayers()) do
-		if TeamsService.GetPlayerRole(player) == "Player" and not TagEffects.IsFrozen(player) then
+		if TeamsService.GetPlayerRole(player) == "Player" and not TagService.IsPlayerFrozen(player) then
 			count = count + 1
 		end
 	end
+
+	debugLog("Unfrozen player count: " .. count)
 	return count
 end
 
 -- Check win conditions
 local function checkWinConditions()
-	if not roundActive then return end
+	if not roundActive then 
+		debugLog("Win condition check skipped - round not active")
+		return 
+	end
 
 	local unfrozenCount = getUnfrozenPlayerCount()
+	debugLog("Checking win conditions: " .. unfrozenCount .. " unfrozen players")
 
 	if unfrozenCount == 0 then
 		-- Taggers win - all players frozen
-		debugLog("Taggers won! All players frozen")
+		debugLog("TAGGERS WIN! All players frozen")
+		roundActive = false -- Prevent further checks
 
 		-- End the match through MatchLoop
 		local MatchLoop = require(game:GetService("ServerScriptService").Modules.MatchLoop)
 		MatchLoop.EndMatch("taggers_win")
+	else
+		debugLog("Game continues - " .. unfrozenCount .. " players still unfrozen")
 	end
 end
 
 -- Start rescue attempt
 local function startRescueAttempt(rescuer: Player, frozen: Player)
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
+	local TagService = require(script.Parent.Parent.TagService)
 	local TeamsService = require(script.Parent.Parent.TeamsService)
 
-	if not TagEffects.IsFrozen(frozen) then return end
+	if not TagService.IsPlayerFrozen(frozen) then return end
 	if TeamsService.GetPlayerRole(rescuer) ~= "Player" then return end
 	if TeamsService.GetPlayerRole(frozen) ~= "Player" then return end
 
@@ -155,7 +165,7 @@ end
 
 -- Update rescue attempts
 local function updateRescueTimers()
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
+	local TagService = require(script.Parent.Parent.TagService)
 	local toRemove = {}
 
 	for key, rescueData in pairs(rescueTimers) do
@@ -164,7 +174,7 @@ local function updateRescueTimers()
 		local startTime = rescueData.startTime
 
 		-- Validate participants
-		if not rescuer.Parent or not frozen.Parent or not TagEffects.IsFrozen(frozen) then
+		if not rescuer.Parent or not frozen.Parent or not TagService.IsPlayerFrozen(frozen) then
 			table.insert(toRemove, key)
 			continue
 		end
@@ -193,9 +203,12 @@ local function updateRescueTimers()
 		-- Check if rescue complete
 		local elapsed = os.clock() - startTime
 		if elapsed >= (FreezeTag.Config.RescueHoldSeconds or 2) then
-			TagEffects.Unfreeze(frozen)
+			TagService.UnfreezePlayer(frozen)
 			debugLog(rescuer.Name .. " rescued " .. frozen.Name)
 			table.insert(toRemove, key)
+
+			-- Check win conditions after rescue
+			checkWinConditions()
 		end
 	end
 
@@ -208,11 +221,11 @@ end
 -- Check for nearby rescue opportunities
 local function checkRescueProximity()
 	local TeamsService = require(script.Parent.Parent.TeamsService)
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
+	local TagService = require(script.Parent.Parent.TagService)
 	local rescueRange = FreezeTag.Config.RescueRange or 6
 
 	for _, player in pairs(Players:GetPlayers()) do
-		if TeamsService.GetPlayerRole(player) ~= "Player" or TagEffects.IsFrozen(player) then
+		if TeamsService.GetPlayerRole(player) ~= "Player" or TagService.IsPlayerFrozen(player) then
 			continue
 		end
 
@@ -223,7 +236,7 @@ local function checkRescueProximity()
 
 		-- Look for nearby frozen teammates
 		for _, other in pairs(Players:GetPlayers()) do
-			if other == player or TeamsService.GetPlayerRole(other) ~= "Player" or not TagEffects.IsFrozen(other) then
+			if other == player or TeamsService.GetPlayerRole(other) ~= "Player" or not TagService.IsPlayerFrozen(other) then
 				continue
 			end
 
@@ -285,7 +298,7 @@ local function startMatchInternal(players: {Player})
 	-- Assign to teams via TeamsService (SERVER AUTHORITY)
 	local TeamsService = require(script.Parent.Parent.TeamsService)
 	local LoadoutService = require(script.Parent.Parent.LoadoutService)
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
+	local TagService = require(script.Parent.Parent.TagService)
 
 	debugLog("DEBUG: About to assign taggers to TeamsService")
 	TeamsService.AssignTaggers(taggers)
@@ -311,19 +324,22 @@ local function startMatchInternal(players: {Player})
 		LoadoutService.RemoveTool(player, Cfg("Tagging.ToolName"))
 	end
 
-	-- Unfreeze everyone
+	-- Unfreeze everyone (SERVER AUTHORITY)
 	for _, player in pairs(players) do
-		TagEffects.Unfreeze(player)
+		TagService.UnfreezePlayer(player)
 	end
 
 	-- IMPORTANT: Subscribe to tag events from TagService
-	local TagService = require(script.Parent.Parent.TagService)
-	local tagConnection = nil
+	if tagConnection then
+		tagConnection:Disconnect()
+	end
 
 	if TagService.Tagged then
 		tagConnection = TagService.Tagged:Connect(function(shooter, target, payload)
+			debugLog("TAG EVENT RECEIVED: " .. shooter.Name .. " tagged " .. target.Name)
 			FreezeTag:OnTag(shooter, target)
 		end)
+		debugLog("Connected to TagService.Tagged event")
 	else
 		warn("TagService.Tagged event not available - tags may not work properly")
 	end
@@ -336,6 +352,7 @@ local function startMatchInternal(players: {Player})
 			-- Also disconnect tag events when match ends
 			if tagConnection then
 				tagConnection:Disconnect()
+				tagConnection = nil
 			end
 			return
 		end
@@ -344,6 +361,10 @@ local function startMatchInternal(players: {Player})
 	end)
 
 	debugLog("Match started: " .. #taggers .. " taggers, " .. #regularPlayers .. " players")
+
+	-- Initial win condition check (in case somehow all players start frozen)
+	task.wait(1) -- Give a moment for everything to settle
+	checkWinConditions()
 end
 
 -- Mode interface implementation
@@ -359,6 +380,7 @@ function FreezeTag:OnMatchStart(players: {Player})
 end
 
 function FreezeTag:OnMatchEnd(state: table?)
+	debugLog("OnMatchEnd called")
 	roundActive = false
 	waitingForPlayers = false
 	rescueTimers = {}
@@ -366,6 +388,11 @@ function FreezeTag:OnMatchEnd(state: table?)
 	if rescueConnection then
 		rescueConnection:Disconnect()
 		rescueConnection = nil
+	end
+
+	if tagConnection then
+		tagConnection:Disconnect()
+		tagConnection = nil
 	end
 
 	if state and state.winner then
@@ -420,21 +447,36 @@ function FreezeTag:OnPlayerRemoving(player: Player)
 end
 
 function FreezeTag:OnTag(shooter: Player, target: Player)
-	if not roundActive then return end
+	debugLog("OnTag called: " .. shooter.Name .. " → " .. target.Name .. " (roundActive: " .. tostring(roundActive) .. ")")
+
+	if not roundActive then 
+		debugLog("OnTag: Round not active, returning")
+		return 
+	end
 
 	local TeamsService = require(script.Parent.Parent.TeamsService)
-	local TagEffects = require(ReplicatedStorage.Modules.Game.TagEffects)
 
-	-- Validate tag (additional security layer)
-	if TeamsService.GetPlayerRole(shooter) ~= "Tagger" then return end
-	if TeamsService.GetPlayerRole(target) ~= "Player" then return end
-	if TagEffects.IsFrozen(target) then return end
+	-- Validate tag (additional security layer) - but don't check if already frozen since TagService already did the work
+	local shooterRole = TeamsService.GetPlayerRole(shooter)
+	local targetRole = TeamsService.GetPlayerRole(target)
 
-	-- Freeze target
-	TagEffects.Freeze(target)
-	debugLog(shooter.Name .. " froze " .. target.Name)
+	debugLog("OnTag validation - Shooter: " .. tostring(shooterRole) .. ", Target: " .. tostring(targetRole))
 
-	-- Check win conditions
+	if shooterRole ~= "Tagger" then 
+		debugLog("OnTag: Shooter not a tagger")
+		return 
+	end
+	if targetRole ~= "Player" then 
+		debugLog("OnTag: Target not a player")
+		return 
+	end
+
+	-- REMOVED the frozen check since TagService already validated and applied the freeze
+	-- The Tagged event only fires for successful tags, so we can trust it
+
+	debugLog(shooter.Name .. " successfully tagged " .. target.Name .. " - checking win conditions")
+
+	-- Always check win conditions when a successful tag happens
 	checkWinConditions()
 end
 
