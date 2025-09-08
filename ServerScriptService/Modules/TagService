@@ -1,11 +1,11 @@
 --[[
 SCRIPT_PATHS
-  Self: ServerScriptService/Modules/TagService.lua
+  Self: ServerScriptService/Modules/TagService
   Requires:
-    - ReplicatedStorage/Modules/Shared/GameConfig
-    - ReplicatedStorage/Modules/Shared/Movement/RaycastUtil
-    - ServerScriptService/Modules/GameDirector.lua
-    - ServerScriptService/Modules/TeamsService.lua
+    - ReplicatedStorage/Shared/GameConfig
+    - ReplicatedStorage/Shared/Movement/RaycastUtil
+    - ServerScriptService/Modules/GameDirector
+    - ServerScriptService/Modules/TeamsService
   Remotes:
     - ReplicatedStorage/Remotes/ReportTag (RemoteEvent, name from GameConfig.RemoteNames.ReportTag)
   UsesConfigKeys:
@@ -13,10 +13,8 @@ SCRIPT_PATHS
     - Debug.Channels
     - Tagging.MaxRange
     - Tagging.EnableLOS
-    - Tagging.LineOfSight.IgnoreNonCollidable
-    - Tagging.LineOfSight.TransparencyThreshold
-    - Tagging.LineOfSight.IgnoreNames
-    - Tagging.LineOfSight.IgnoreNameContains
+    - Tagging.LineOfSight.*
+    - Tagging.OneTagPerShot
     - Teams.FriendlyFire
     - RemoteNames.ReportTag
     - Folders.Remotes
@@ -40,6 +38,9 @@ local TagService = {}
 local taggedEvent = Instance.new("BindableEvent")
 TagService.Tagged = taggedEvent.Event
 
+-- AUTHORITATIVE FREEZE STATE (server-only)
+local frozenPlayers: {[Player]: boolean} = {}
+
 local function Cfg(path)
 	local node = GameConfig
 	for seg in string.gmatch(path, "[^%.]+") do
@@ -53,6 +54,155 @@ local function debugLog(message)
 		print("[Tag] " .. message)
 	end
 end
+
+-- SERVER AUTHORITY: Freeze a player
+function TagService.FreezePlayer(player: Player)
+	if not player or not player.Parent then return end
+
+	frozenPlayers[player] = true
+
+	local character = player.Character
+	if not character then 
+		debugLog("SERVER: Marked " .. player.Name .. " as frozen (no character yet)")
+		return 
+	end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if humanoid then
+		-- Store original values as attributes
+		if humanoid:GetAttribute("OriginalWalkSpeed") == nil then
+			humanoid:SetAttribute("OriginalWalkSpeed", humanoid.WalkSpeed)
+		end
+		if humanoid:GetAttribute("OriginalJumpPower") == nil then
+			humanoid:SetAttribute("OriginalJumpPower", humanoid.JumpPower)
+		end
+
+		-- Apply freeze
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+	end
+
+	-- Create visual indicator for clients (server authority)
+	local frozenValue = character:FindFirstChild("IsFrozen")
+	if not frozenValue then
+		frozenValue = Instance.new("BoolValue")
+		frozenValue.Name = "IsFrozen"
+		frozenValue.Parent = character
+	end
+	frozenValue.Value = true
+
+	-- Anchor for extra security if configured
+	if rootPart and Cfg("FreezeTag.FreezeMovement") then
+		rootPart.Anchored = true
+	end
+
+	debugLog("SERVER: Froze " .. player.Name)
+end
+
+-- SERVER AUTHORITY: Unfreeze a player
+function TagService.UnfreezePlayer(player: Player)
+	if not player or not player.Parent then return end
+
+	-- EXPLICITLY clear frozen state FIRST
+	frozenPlayers[player] = nil
+
+	local character = player.Character
+	if not character then 
+		debugLog("SERVER: Cleared frozen state for " .. player.Name .. " (no character)")
+		return 
+	end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if humanoid then
+		-- Restore movement
+		local originalWalkSpeed = humanoid:GetAttribute("OriginalWalkSpeed")
+		local originalJumpPower = humanoid:GetAttribute("OriginalJumpPower")
+
+		humanoid.WalkSpeed = originalWalkSpeed or 16
+		humanoid.JumpPower = originalJumpPower or 50
+
+		humanoid:SetAttribute("OriginalWalkSpeed", nil)
+		humanoid:SetAttribute("OriginalJumpPower", nil)
+	end
+
+	-- Remove frozen indicator
+	local frozenValue = character:FindFirstChild("IsFrozen")
+	if frozenValue then
+		frozenValue:Destroy()
+	end
+
+	-- Unanchor
+	if rootPart then
+		rootPart.Anchored = false
+	end
+
+	debugLog("SERVER: Unfroze " .. player.Name)
+end
+
+-- Check if player is frozen (server authority) - SIMPLIFIED VERSION
+function TagService.IsPlayerFrozen(player: Player): boolean
+	-- Server state is the single source of truth
+	local serverFrozen = frozenPlayers[player] == true
+
+	-- Only validate character state during actual gameplay, not during respawning
+	if player.Character and player.Character:FindFirstChild("Humanoid") then
+		local frozenValue = player.Character:FindFirstChild("IsFrozen")
+		if frozenValue and frozenValue.Value ~= serverFrozen then
+			-- Fix mismatch silently during gameplay
+			frozenValue.Value = serverFrozen
+		elseif not frozenValue and serverFrozen then
+			-- Create missing frozen indicator
+			local newFrozenValue = Instance.new("BoolValue")
+			newFrozenValue.Name = "IsFrozen"
+			newFrozenValue.Value = true
+			newFrozenValue.Parent = player.Character
+		end
+	end
+
+	return serverFrozen
+end
+
+-- Unfreeze all players (server authority)
+function TagService.UnfreezeAllPlayers()
+	local playerList = {}
+	for player, _ in pairs(frozenPlayers) do
+		table.insert(playerList, player)
+	end
+
+	-- Clear the table first
+	frozenPlayers = {}
+
+	-- Then unfreeze each player
+	for _, player in pairs(playerList) do
+		TagService.UnfreezePlayer(player)
+	end
+
+	debugLog("SERVER: Unfroze all players (" .. #playerList .. " total)")
+end
+
+-- Handle respawn - reapply frozen state
+local function onCharacterAdded(player: Player)
+	if TagService.IsPlayerFrozen(player) then
+		task.wait(0.1) -- Ensure character is loaded
+		TagService.FreezePlayer(player)
+	end
+end
+
+-- Set up event handlers
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		onCharacterAdded(player)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	frozenPlayers[player] = nil
+	debugLog("SERVER: Cleaned up frozen state for " .. player.Name)
+end)
 
 -- Prefer Humanoid.RootPart (movement systems often swap/rename root)
 local function getRootPart(char)
@@ -233,6 +383,15 @@ local function validateTag(attacker, victim)
 		return false, "Only taggers can tag"
 	end
 
+	if victimRole ~= "Player" then
+		return false, "Can only tag players"
+	end
+
+	-- Check if already frozen - server state is authoritative
+	if TagService.IsPlayerFrozen(victim) then
+		return false, "Target already frozen"
+	end
+
 	local allowFriendly = (GameConfig.Teams and GameConfig.Teams.FriendlyFire) or false
 	if (not allowFriendly) and (attackerRole == victimRole) then
 		return false, "Friendly fire disabled"
@@ -251,7 +410,13 @@ function TagService.ValidateAndApplyTag(attacker, victim, payload)
 		debugLog(("Tag rejected: %s → %s (%s)"):format(attacker and attacker.Name or "?", victim and victim.Name or "?", reason or "unknown"))
 		return false
 	end
+
 	debugLog(("Tag confirmed: %s → %s"):format(attacker.Name, victim.Name))
+
+	-- SERVER AUTHORITY: Apply freeze
+	TagService.FreezePlayer(victim)
+
+	-- Fire event for game modes
 	taggedEvent:Fire(attacker, victim, payload)
 	return true
 end
@@ -260,12 +425,30 @@ function TagService.ReportTag(attacker, victim, payload)
 	return TagService.ValidateAndApplyTag(attacker, victim, payload)
 end
 
+-- Multi-shot handling with OneTagPerShot option
+function TagService.ProcessMultipleHits(attacker, victims, payload)
+	local oneTagPerShot = Cfg("Tagging.OneTagPerShot") or false
+	local hitCount = 0
+
+	for _, victim in ipairs(victims) do
+		if TagService.ValidateAndApplyTag(attacker, victim, payload) then
+			hitCount = hitCount + 1
+			if oneTagPerShot then
+				break -- Stop after first valid hit
+			end
+		end
+	end
+
+	return hitCount
+end
+
+-- Initialize remote connection
 do
 	local remotesFolderName = (GameConfig.Folders and GameConfig.Folders.Remotes) or "Remotes"
-	local remotes = ReplicatedStorage:FindFirstChild(remotesFolderName)
+	local remotes = ReplicatedStorage:WaitForChild(remotesFolderName)
 	if remotes then
 		local reportName = (GameConfig.RemoteNames and GameConfig.RemoteNames.ReportTag) or "ReportTag"
-		local tagRemote = remotes:FindFirstChild(reportName)
+		local tagRemote = remotes:WaitForChild(reportName)
 		if tagRemote and tagRemote:IsA("RemoteEvent") then
 			tagRemote.OnServerEvent:Connect(function(player, victimRef, payload)
 				local victim = nil
