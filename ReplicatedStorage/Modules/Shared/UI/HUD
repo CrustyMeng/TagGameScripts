@@ -27,6 +27,7 @@ SCRIPT_PATHS
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
 
 local GameConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("GameConfig"))
 
@@ -188,11 +189,11 @@ local function createMidJoinPrompt(data)
 		respond(false)
 	end)
 
-	-- Timeout countdown
+	-- Timeout countdown - FIXED: Use proper dt from connection
 	local timeLeft = Cfg("MidJoin.PromptTimeout")
 	local timeoutConnection = nil
-	timeoutConnection = game:GetService("RunService").Heartbeat:Connect(function()
-		timeLeft = timeLeft - game:GetService("RunService").Heartbeat:Wait()
+	timeoutConnection = RunService.Heartbeat:Connect(function(dt)
+		timeLeft = timeLeft - dt -- FIXED: Use dt parameter instead of Wait()
 
 		if timeLeft <= 0 then
 			timeoutConnection:Disconnect()
