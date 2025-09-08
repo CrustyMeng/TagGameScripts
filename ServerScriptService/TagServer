@@ -1,10 +1,34 @@
+--[[
+SCRIPT_PATHS
+  Self: ServerScriptService/TagServer
+  Requires:
+    - ReplicatedStorage/Shared/GameConfig
+    - ServerScriptService/Modules/TagService
+  Remotes:
+    - ReplicatedStorage/Remotes/FireRay (RemoteEvent, name from GameConfig.RemoteNames.FireRay)
+    - ReplicatedStorage/Remotes/State (RemoteEvent, name from GameConfig.RemoteNames.State)
+  UsesConfigKeys:
+    - Tagging.ToolName
+    - Tagging.StartAmmo
+    - Tagging.MaxAmmo
+    - Tagging.FireRateRPM
+    - Tagging.CooldownSeconds
+    - Tagging.AutoReload
+    - Tagging.ReloadPerShellSeconds
+    - Tagging.LockDuringReload
+    - Tagging.OriginOffset
+    - Tagging.MaxRange
+    - Tagging.OneTagPerShot
+    - RemoteNames.FireRay
+    - RemoteNames.State
+]]
+
 -- ServerScriptService/TagServer.server.lua  
 -- Server-side tag validation and tool state management (updated for new system)
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
-
 
 local GameConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shared"):WaitForChild("GameConfig"))
 
@@ -22,29 +46,10 @@ local function Cfg(path)
 	return value
 end
 
--- Create remotes folder
-local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-if not remotes then
-	remotes = Instance.new("Folder")
-	remotes.Name = "Remotes"
-	remotes.Parent = ReplicatedStorage
-end
-
--- Create fire remote
-local fireRemote = remotes:FindFirstChild(Cfg("RemoteNames.FireRay"))
-if not fireRemote then
-	fireRemote = Instance.new("RemoteEvent")
-	fireRemote.Name = Cfg("RemoteNames.FireRay")
-	fireRemote.Parent = remotes
-end
-
--- Create state remote
-local stateRemote = remotes:FindFirstChild(Cfg("RemoteNames.State"))
-if not stateRemote then
-	stateRemote = Instance.new("RemoteEvent")
-	stateRemote.Name = Cfg("RemoteNames.State")
-	stateRemote.Parent = remotes
-end
+-- Wait for remotes (created by GameStartup)
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local fireRemote = remotes:WaitForChild(Cfg("RemoteNames.FireRay"))
+local stateRemote = remotes:WaitForChild(Cfg("RemoteNames.State"))
 
 -- Per-player tool state tracking
 type ToolState = {
@@ -177,7 +182,7 @@ fireRemote.OnServerEvent:Connect(function(shooter: Player, _originFromClient: Ve
 
 	local state = getState(shooter)
 
-	-- Fire rate check
+	-- Fire rate check with proper timestamps
 	local now = os.clock()
 	local fireRateRPM = Cfg("Tagging.FireRateRPM")
 	local cooldown = (fireRateRPM > 0) and (60 / fireRateRPM) or Cfg("Tagging.CooldownSeconds")
@@ -220,18 +225,40 @@ fireRemote.OnServerEvent:Connect(function(shooter: Player, _originFromClient: Ve
 	raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
 	raycastParams.FilterDescendantsInstances = {character}
 
-	local tagged = false
+	local hitPlayers = {}
 	local maxRange = Cfg("Tagging.MaxRange")
+	local oneTagPerShot = Cfg("Tagging.OneTagPerShot") or false
 
 	-- Process each ray
 	for _, direction in pairs(unitDirs) do
 		if typeof(direction) ~= "Vector3" then continue end
 
 		local raycastResult = workspace:Raycast(origin, direction.Unit * math.min(maxRange, 2000), raycastParams)
-		if raycastResult and handleRaycastHit(shooter, raycastResult) then
+		if raycastResult then
+			local hitPart = raycastResult.Instance
+			if hitPart then
+				local model = hitPart:FindFirstAncestorOfClass("Model")
+				if isValidTarget(shooter, model) then
+					local hitPlayer = Players:GetPlayerFromCharacter(model)
+					if hitPlayer and not table.find(hitPlayers, hitPlayer) then
+						table.insert(hitPlayers, hitPlayer)
+						if oneTagPerShot then
+							break -- Stop after first potential target
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- Process all hits through TagService
+	local tagged = false
+	for _, victim in pairs(hitPlayers) do
+		if TagService.ValidateAndApplyTag(shooter, victim) then
 			tagged = true
-			-- Note: Original had OneTagPerShot option, but it's not in GameConfig
-			-- Could add: if GameConfig.Tagging.OneTagPerShot then break end
+			if oneTagPerShot then
+				break -- Stop after first successful tag
+			end
 		end
 	end
 
